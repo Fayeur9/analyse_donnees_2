@@ -307,6 +307,53 @@ def creer_vue_globale(charts_unifies: pd.DataFrame, tracks: pd.DataFrame) -> pd.
     return fusion.drop(columns=["song_key", "artist_key"])
 
 
+def enrichir_avec_genre_artiste(vue: pd.DataFrame) -> pd.DataFrame:
+    """Fallback : remplit track_genre manquant avec le genre principal de l'artiste (df_merged.csv).
+
+    Pour chaque ligne sans track_genre, on cherche dans df_merged le genre de l'artiste
+    sur la même chanson/artiste/date. Si trouvé, on remplit track_genre et on marque
+    genre_source = 'artiste' (vs 'track' pour les matchs songs.csv).
+    """
+    df_merged_path = os.path.join(DOSSIER_DATA, "df_merged.csv")
+    if not os.path.exists(df_merged_path):
+        vue["genre_source"] = vue["track_genre"].apply(lambda x: "track" if pd.notna(x) else "inconnu")
+        return vue
+
+    merged = pd.read_csv(df_merged_path, usecols=["Date", "Song", "Artist", "main_genre"])
+    merged.columns = ["date_m", "song_m", "artist_m", "main_genre"]
+
+    # Normalisation pour jointure insensible à la casse
+    merged["song_key"] = merged["song_m"].apply(_normaliser_pour_matching)
+    merged["artist_key"] = merged["artist_m"].apply(_normaliser_pour_matching)
+    merged["date_key"] = merged["date_m"].astype(str).str.strip()
+
+    # Dédupliquer : un artiste → un genre (le plus fréquent par clé artiste)
+    genre_par_artiste = (
+        merged[merged["main_genre"] != "inconnu"]
+        .groupby("artist_key")["main_genre"]
+        .agg(lambda s: s.value_counts().index[0])
+        .reset_index()
+    )
+
+    result = vue.copy()
+    result["song_key"] = result["song"].apply(_normaliser_pour_matching)
+    result["artist_key"] = result["artist"].apply(_normaliser_pour_matching)
+
+    # Marquer la source des genres déjà remplis
+    result["genre_source"] = result["track_genre"].apply(lambda x: "track" if pd.notna(x) else "inconnu")
+
+    # Jointure avec genre_par_artiste sur artist_key
+    result = result.merge(genre_par_artiste, on="artist_key", how="left")
+
+    # Remplir les track_genre manquants avec main_genre de l'artiste
+    masque_manquant = result["track_genre"].isna() & result["main_genre"].notna()
+    result.loc[masque_manquant, "track_genre"] = result.loc[masque_manquant, "main_genre"]
+    result.loc[masque_manquant, "genre_source"] = "artiste"
+
+    result = result.drop(columns=["song_key", "artist_key", "main_genre"])
+    return result
+
+
 def nettoyer_tous_les_csv() -> Dict[str, pd.DataFrame]:
     """Nettoie les 5 charts + songs.csv, fusionne en mémoire, sort SEULEMENT musique_complete.csv."""
     os.makedirs(DOSSIER_SORTIE, exist_ok=True)
@@ -350,6 +397,10 @@ def nettoyer_tous_les_csv() -> Dict[str, pd.DataFrame]:
 
     # Créer le fichier unifié (SEUL fichier sauvegardé sur disque)
     vue_globale = creer_vue_globale(charts_unifies, features)
+
+    # Enrichir les genres manquants avec le genre principal de l'artiste (df_merged.csv)
+    if not vue_globale.empty:
+        vue_globale = enrichir_avec_genre_artiste(vue_globale)
     
     resultat: Dict[str, pd.DataFrame] = {}
     if not vue_globale.empty:

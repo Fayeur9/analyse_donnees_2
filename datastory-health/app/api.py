@@ -93,7 +93,9 @@ def token_requis(func):
     return wrapper
 
 
-def _calculer_evolution_genres(period: str = "decennie", chart: str = "all", top_n: int = 8):
+def _calculer_evolution_genres(
+    period: str = "decennie", chart: str = "all", top_n: int = 8, genre_source: str = "all"
+):
     """Agrege l'evolution des genres selon la periode demandee."""
     data = load_music_complete_data()
     data = prepare_charts_data(data)
@@ -107,6 +109,9 @@ def _calculer_evolution_genres(period: str = "decennie", chart: str = "all", top
 
     if chart != "all" and "source_chart" in data.columns:
         data = data[data["source_chart"] == chart]
+
+    if genre_source != "all" and "genre_source" in data.columns:
+        data = data[data["genre_source"] == genre_source]
 
     if "track_genre" not in data.columns:
         data["track_genre"] = "inconnu"
@@ -129,6 +134,7 @@ def _calculer_evolution_genres(period: str = "decennie", chart: str = "all", top
     return {
         "periode": period,
         "chart": chart,
+        "genre_source": genre_source,
         "resultats": top.to_dict(orient="records"),
         "resume": {
             "lignes_analysees": int(len(data)),
@@ -495,7 +501,26 @@ def stats():
     data = load_music_complete_data()
     data = prepare_charts_data(data)
     if data.empty:
-        return jsonify({"total_lignes": 0, "total_artistes": 0, "total_morceaux": 0, "periode": None}), 200
+        return (
+            jsonify(
+                {
+                    "total_lignes": 0,
+                    "total_artistes": 0,
+                    "total_morceaux": 0,
+                    "periode": None,
+                    "couverture_genres": {"avec_genre": 0, "sans_genre": 0, "pourcentage_avec_genre": 0.0},
+                    "sources_genres": {},
+                }
+            ),
+            200,
+        )
+
+    avec_genre = int(data["track_genre"].notna().sum()) if "track_genre" in data.columns else 0
+    sans_genre = int(len(data) - avec_genre)
+    sources_genres = {}
+    if "genre_source" in data.columns:
+        repartition = data["genre_source"].fillna("inconnu").value_counts().to_dict()
+        sources_genres = {str(k): int(v) for k, v in repartition.items()}
 
     return (
         jsonify(
@@ -503,6 +528,12 @@ def stats():
                 "total_lignes": int(len(data)),
                 "total_artistes": int(data["artist"].nunique()),
                 "total_morceaux": int(data["song"].nunique()),
+                "couverture_genres": {
+                    "avec_genre": avec_genre,
+                    "sans_genre": sans_genre,
+                    "pourcentage_avec_genre": round((avec_genre / len(data)) * 100, 2),
+                },
+                "sources_genres": sources_genres,
                 "periode": {
                     "debut": str(data["date"].min().date()),
                     "fin": str(data["date"].max().date()),
@@ -539,14 +570,22 @@ def datasets(_charge_utile):
 def genres_evolution():
     period = request.args.get("period", "decennie").lower().strip()
     chart = request.args.get("chart", "all").lower().strip()
+    genre_source = request.args.get("genre_source", "all").lower().strip()
     top_n = request.args.get("top_n", "8").strip()
 
     if period not in ["decennie", "annee"]:
         return jsonify({"error": "period doit etre 'decennie' ou 'annee'"}), 400
+    if genre_source not in ["all", "track", "artiste"]:
+        return jsonify({"error": "genre_source doit etre 'all', 'track' ou 'artiste'"}), 400
     if not top_n.isdigit():
         return jsonify({"error": "top_n doit etre un entier positif"}), 400
 
-    resultat = _calculer_evolution_genres(period=period, chart=chart, top_n=max(1, int(top_n)))
+    resultat = _calculer_evolution_genres(
+        period=period,
+        chart=chart,
+        top_n=max(1, int(top_n)),
+        genre_source=genre_source,
+    )
     return jsonify(resultat), 200
 
 

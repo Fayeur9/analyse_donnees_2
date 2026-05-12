@@ -2,13 +2,36 @@
 
 import os
 from datetime import datetime
+from pathlib import Path
 
+from dotenv import load_dotenv
 from sqlalchemy import Boolean, Column, Date, DateTime, Float, Integer, String, Text, create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///music_data.db")
+load_dotenv()
+
+
+def _resolve_database_url() -> str:
+    """Retourne une URL de base stable quel que soit le dossier de lancement."""
+    project_root = Path(__file__).resolve().parent.parent
+    raw_url = os.getenv("DATABASE_URL", "sqlite:///music_data.db")
+
+    if raw_url.startswith("sqlite:///"):
+        sqlite_path = raw_url.replace("sqlite:///", "", 1)
+        if sqlite_path == ":memory:":
+            return raw_url
+
+        path_obj = Path(sqlite_path)
+        if not path_obj.is_absolute():
+            path_obj = (project_root / path_obj).resolve()
+        return f"sqlite:///{path_obj.as_posix()}"
+
+    return raw_url
+
+
+DATABASE_URL = _resolve_database_url()
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()

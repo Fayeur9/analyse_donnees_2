@@ -9,7 +9,8 @@ Gestion du cycle de vie complet du jeton JWT :
 """
 
 import datetime
-import time
+import json
+from pathlib import Path
 
 import requests
 import streamlit as st
@@ -20,6 +21,7 @@ import streamlit as st
 API_URL = "http://localhost:5000"
 SEUIL_REFRESH_SECONDES = 5 * 60   # rafraîchir si < 5 min restantes
 TIMEOUT_REQUETE = 10               # secondes max par appel HTTP
+SESSION_FILE = Path(__file__).resolve().parent / ".streamlit_auth_session.json"
 
 # ---------------------------------------------------------------------------
 # Helpers — gestion du session_state
@@ -33,6 +35,7 @@ def _init_session():
         "username": None,
         "role": None,
         "user_id": None,
+        "auth_view": "login",
         "login_error": "",
     }
     for cle, valeur in defaults.items():
@@ -48,13 +51,55 @@ def _stocker_token(token: str, expires_in_minutes: int, username: str, role: str
     st.session_state.role = role
     st.session_state.user_id = user_id
     st.session_state.login_error = ""
+    _sauvegarder_session_locale()
 
 
 def _deconnecter():
     """Efface toutes les données de session."""
     for cle in ["access_token", "expires_at", "username", "role", "user_id"]:
         st.session_state[cle] = None
+    st.session_state.auth_view = "login"
     st.session_state.login_error = ""
+    if SESSION_FILE.exists():
+        SESSION_FILE.unlink()
+
+
+def _sauvegarder_session_locale():
+    """Sauvegarde la session auth localement pour survivre a un refresh navigateur."""
+    if not st.session_state.get("access_token"):
+        return
+
+    payload = {
+        "access_token": st.session_state.access_token,
+        "expires_at": st.session_state.expires_at.isoformat() if st.session_state.expires_at else None,
+        "username": st.session_state.username,
+        "role": st.session_state.role,
+        "user_id": st.session_state.user_id,
+    }
+    SESSION_FILE.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _restaurer_session_locale() -> bool:
+    """Recharge une session auth sauvegardee si elle est encore valide."""
+    if not SESSION_FILE.exists() or st.session_state.get("access_token"):
+        return False
+
+    try:
+        payload = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
+        expires_raw = payload.get("expires_at")
+        expires_at = datetime.datetime.fromisoformat(expires_raw) if expires_raw else None
+    except Exception:
+        return False
+
+    if not payload.get("access_token") or not expires_at or expires_at <= datetime.datetime.utcnow():
+        return False
+
+    st.session_state.access_token = payload.get("access_token")
+    st.session_state.expires_at = expires_at
+    st.session_state.username = payload.get("username")
+    st.session_state.role = payload.get("role")
+    st.session_state.user_id = payload.get("user_id")
+    return True
 
 
 def _est_connecte() -> bool:
@@ -96,6 +141,7 @@ def _tenter_refresh() -> bool:
         st.session_state.expires_at = datetime.datetime.utcnow() + datetime.timedelta(
             minutes=data.get("expires_in_minutes", 30)
         )
+        _sauvegarder_session_locale()
         return True
 
     # Token expiré ou invalide → déconnexion
@@ -138,13 +184,22 @@ def _appel_api(methode: str, chemin: str, **kwargs) -> requests.Response | None:
 # ---------------------------------------------------------------------------
 
 def page_connexion():
-    st.title("🎵 DataStory Music")
-    st.subheader("Connexion")
+    gauche, centre, droite = st.columns([1.5, 1, 1.5])
+    del gauche, droite
 
-    with st.form("form_login"):
-        username = st.text_input("Nom d'utilisateur")
-        password = st.text_input("Mot de passe", type="password")
-        soumettre = st.form_submit_button("Se connecter")
+    with centre:
+        st.title("🎵 DataStory Music")
+        st.subheader("Connexion")
+
+        with st.form("form_login"):
+            username = st.text_input("Nom d'utilisateur")
+            password = st.text_input("Mot de passe", type="password")
+            soumettre = st.form_submit_button("Se connecter", use_container_width=True)
+
+        st.caption("Pas encore de compte ?")
+        if st.button("Créer un compte", use_container_width=True):
+            st.session_state.auth_view = "register"
+            st.rerun()
 
     if soumettre:
         if not username or not password:
@@ -190,6 +245,55 @@ def page_connexion():
             st.warning("Trop de tentatives. Réessayez dans une minute.")
         else:
             st.error(f"Erreur inattendue ({rep.status_code}).")
+
+
+def page_inscription():
+    gauche, centre, droite = st.columns([1.5, 1, 1.5])
+    del gauche, droite
+
+    with centre:
+        st.title("🎵 DataStory Music")
+        st.subheader("Inscription")
+
+        with st.form("form_register"):
+            username = st.text_input("Nom d'utilisateur")
+            email = st.text_input("Email")
+            password = st.text_input("Mot de passe", type="password")
+            soumettre = st.form_submit_button("Créer le compte", use_container_width=True)
+
+        if st.button("Retour à la connexion", use_container_width=True):
+            st.session_state.auth_view = "login"
+            st.rerun()
+
+    if not soumettre:
+        return
+
+    if not username or not email or not password:
+        st.error("Veuillez remplir tous les champs.")
+        return
+
+    try:
+        rep = requests.post(
+            f"{API_URL}/register",
+            json={"username": username, "email": email, "password": password},
+            timeout=TIMEOUT_REQUETE,
+        )
+    except requests.RequestException as exc:
+        st.error(f"Impossible de joindre l'API : {exc}")
+        return
+
+    if rep.status_code == 201:
+        st.success("Compte créé avec succès. Vous pouvez vous connecter.")
+        st.session_state.auth_view = "login"
+        st.rerun()
+    elif rep.status_code == 400:
+        st.error("Données invalides (vérifiez email, username et mot de passe).")
+    elif rep.status_code == 409:
+        st.warning("Nom d'utilisateur ou email déjà utilisé.")
+    elif rep.status_code == 429:
+        st.warning("Trop de tentatives. Réessayez dans une minute.")
+    else:
+        st.error(f"Erreur inattendue ({rep.status_code}).")
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +368,17 @@ def page_stats():
         col2.metric("Artistes uniques", f"{data.get('total_artistes', 0):,}")
         col3.metric("Morceaux uniques", f"{data.get('total_morceaux', 0):,}")
 
+        couverture = data.get("couverture_genres", {})
+        col4, col5, col6 = st.columns(3)
+        col4.metric("Avec genre", f"{couverture.get('avec_genre', 0):,}")
+        col5.metric("Sans genre", f"{couverture.get('sans_genre', 0):,}")
+        col6.metric("Couverture", f"{couverture.get('pourcentage_avec_genre', 0):.2f}%")
+
+        sources = data.get("sources_genres", {})
+        if sources:
+            st.subheader("Sources des genres")
+            st.bar_chart(sources)
+
         periode = data.get("periode") or {}
         if periode:
             st.info(
@@ -276,16 +391,22 @@ def page_stats():
 def page_genres():
     st.header("🎼 Évolution des genres musicaux")
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         period = st.selectbox("Période", ["decennie", "annee"], format_func=lambda x: "Décennie" if x == "decennie" else "Année")
     with col2:
         top_n = st.slider("Top N genres", min_value=3, max_value=15, value=8)
+    with col3:
+        source = st.selectbox(
+            "Source du genre",
+            ["all", "track", "artiste"],
+            format_func=lambda x: "Toutes" if x == "all" else ("Track matché" if x == "track" else "Genre artiste"),
+        )
 
     try:
         rep = requests.get(
             f"{API_URL}/genres/evolution",
-            params={"period": period, "top_n": top_n},
+            params={"period": period, "top_n": top_n, "genre_source": source},
             timeout=TIMEOUT_REQUETE,
         )
     except requests.RequestException as exc:
@@ -371,12 +492,16 @@ def main():
         layout="wide",
     )
     _init_session()
+    _restaurer_session_locale()
 
     # -----------------------------------------------------------------------
     # Si non connecté → écran de login
     # -----------------------------------------------------------------------
     if not _est_connecte():
-        page_connexion()
+        if st.session_state.auth_view == "register":
+            page_inscription()
+        else:
+            page_connexion()
         return
 
     # -----------------------------------------------------------------------
