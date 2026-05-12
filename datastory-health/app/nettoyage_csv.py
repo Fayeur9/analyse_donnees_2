@@ -161,21 +161,58 @@ def nettoyer_chart(df: pd.DataFrame, source_chart: str) -> pd.DataFrame:
 
 
 def nettoyer_track_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Nettoie le dataset audio train.csv."""
+    """Nettoie le dataset audio songs.csv (550k chansons Spotify avec genres/niche_genres)."""
+    import json
+    
     df = df.copy()
     df.columns = [normaliser_nom_colonne(c) for c in df.columns]
+
+    # Renommer colonnes songs.csv pour compatibilité
+    colonnes_renommage = {
+        "id": "track_id",
+        "name": "track_name",
+        "genre": "track_genre",
+    }
+    for ancien, nouveau in colonnes_renommage.items():
+        if ancien in df.columns:
+            df = df.rename(columns={ancien: nouveau})
 
     if "unnamed_0" in df.columns:
         df = df.drop(columns=["unnamed_0"])
 
-    for col in ["track_id", "artists", "album_name", "track_name", "track_genre"]:
+    # IMPORTANT: Dans songs.csv, 'artists' est au format JSON ["Artist1", "Artist2", ...]
+    # Il faut extraire le premier artiste (ou concaténer) et le normaliser
+    if "artists" in df.columns:
+        def parse_artists_json(val):
+            if pd.isna(val):
+                return ""
+            try:
+                val_str = str(val).strip()
+                if val_str.startswith('['):
+                    artists_list = json.loads(val_str)
+                    # Prendre le premier artiste ou tous concaténés
+                    if isinstance(artists_list, list) and len(artists_list) > 0:
+                        return " ".join(artists_list) if len(artists_list) > 1 else artists_list[0]
+                    return ""
+                else:
+                    return val_str
+            except (json.JSONDecodeError, ValueError):
+                return ""
+        
+        df["artists"] = df["artists"].apply(parse_artists_json)
+
+    # Normaliser texte
+    for col in ["track_id", "artists", "album_name", "track_name", "track_genre", "niche_genres"]:
         if col in df.columns:
             df[col] = _normaliser_texte(df[col])
 
-    int_cols = ["popularity", "duration_ms", "key", "mode", "time_signature"]
+    # Convertir en entier
+    int_cols = ["popularity", "duration_ms", "key", "mode", "year"]
     for col in int_cols:
-        _convertir_entier(df, col)
+        if col in df.columns:
+            _convertir_entier(df, col)
 
+    # Convertir en float
     float_cols = [
         "danceability",
         "energy",
@@ -191,8 +228,28 @@ def nettoyer_track_features(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
-    if "explicit" in df.columns:
-        df["explicit"] = df["explicit"].astype(str).str.lower().isin(["true", "1", "yes"])
+    # Garder seulement les colonnes utiles (genre + niche_genres + features)
+    colonnes_gardees = [
+        "track_id",
+        "track_name",
+        "artists",
+        "album_name",
+        "track_genre",
+        "niche_genres",
+        "popularity",
+        "danceability",
+        "energy",
+        "loudness",
+        "speechiness",
+        "acousticness",
+        "instrumentalness",
+        "liveness",
+        "valence",
+        "tempo",
+        "duration_ms",
+        "year",
+    ]
+    df = df[[col for col in colonnes_gardees if col in df.columns]]
 
     return df.drop_duplicates(subset=["track_id"]).reset_index(drop=True)
 
@@ -226,18 +283,24 @@ def creer_vue_globale(charts_unifies: pd.DataFrame, tracks: pd.DataFrame) -> pd.
     droite["song_key"] = droite["track_name"].apply(_normaliser_pour_matching)
     droite["artist_key"] = droite["artists"].apply(_normaliser_pour_matching)
 
-    colonnes_features = [
-        "song_key",
-        "artist_key",
-        "track_id",
-        "track_genre",
-        "popularity",
-        "danceability",
-        "energy",
-        "valence",
-        "tempo",
-        "explicit",
-    ]
+    # Colonnes de features - adaptées au dataset disponible
+    colonnes_features = ["song_key", "artist_key", "track_id", "track_genre"]
+    
+    # Ajouter niche_genres si présent (nouveau dans songs.csv)
+    if "niche_genres" in droite.columns:
+        colonnes_features.append("niche_genres")
+    
+    # Ajouter colonnes audio features (communes)
+    for col in ["popularity", "danceability", "energy", "valence", "tempo", "duration_ms", "year"]:
+        if col in droite.columns:
+            colonnes_features.append(col)
+    
+    # Ajouter explicit si présent (ancien dataset train.csv)
+    if "explicit" in droite.columns:
+        colonnes_features.append("explicit")
+    
+    # Filtrer pour colonnes qui existent vraiment
+    colonnes_features = [col for col in colonnes_features if col in droite.columns]
     
     droite = droite[colonnes_features].drop_duplicates(subset=["song_key", "artist_key"])
     fusion = gauche.merge(droite, how="left", on=["song_key", "artist_key"])
@@ -245,9 +308,10 @@ def creer_vue_globale(charts_unifies: pd.DataFrame, tracks: pd.DataFrame) -> pd.
 
 
 def nettoyer_tous_les_csv() -> Dict[str, pd.DataFrame]:
-    """Nettoie tous les CSV musique et ecrit les sorties dans data/clean/."""
+    """Nettoie les 5 charts + songs.csv, fusionne en mémoire, sort SEULEMENT musique_complete.csv."""
     os.makedirs(DOSSIER_SORTIE, exist_ok=True)
 
+    # Charger et nettoyer les 5 charts (en mémoire uniquement)
     fichiers_charts = [
         "billboard200.csv",
         "digital_songs.csv",
@@ -255,39 +319,39 @@ def nettoyer_tous_les_csv() -> Dict[str, pd.DataFrame]:
         "radio.csv",
         "streaming_songs.csv",
     ]
-
-    resultat: Dict[str, pd.DataFrame] = {}
+    
     charts: List[pd.DataFrame] = []
-
+    
     for nom_fichier in fichiers_charts:
         chemin = os.path.join(DOSSIER_DATA, nom_fichier)
         if not os.path.exists(chemin):
             continue
-
+        
         brut = charger_csv(chemin)
         source_chart = os.path.splitext(nom_fichier)[0]
         propre = nettoyer_chart(brut, source_chart)
-        sortie = os.path.join(DOSSIER_SORTIE, nom_fichier)
-        propre.to_csv(sortie, index=False)
-        resultat[nom_fichier] = propre
         charts.append(propre)
 
-    train_path = os.path.join(DOSSIER_DATA, "train.csv")
+    # Nettoyer songs.csv (550k chansons Spotify avec genres + niche_genres)
+    songs_path = os.path.join(DOSSIER_DATA, "songs.csv")
     features = pd.DataFrame()
-    if os.path.exists(train_path):
-        brut_train = charger_csv(train_path)
-        features = nettoyer_track_features(brut_train)
-        sortie_train = os.path.join(DOSSIER_SORTIE, "train.csv")
-        features.to_csv(sortie_train, index=False)
-        resultat["train.csv"] = features
+    if os.path.exists(songs_path):
+        brut_songs = charger_csv(songs_path)
+        features = nettoyer_track_features(brut_songs)
+    else:
+        # Fallback si songs.csv n'existe pas, essayer train.csv (ancien dataset)
+        train_path = os.path.join(DOSSIER_DATA, "train.csv")
+        if os.path.exists(train_path):
+            brut_train = charger_csv(train_path)
+            features = nettoyer_track_features(brut_train)
 
+    # Fusionner les 5 charts en mémoire
     charts_unifies = fusionner_charts(charts)
-    if not charts_unifies.empty:
-        sortie_charts = os.path.join(DOSSIER_SORTIE, "charts_unifies.csv")
-        charts_unifies.to_csv(sortie_charts, index=False)
-        resultat["charts_unifies.csv"] = charts_unifies
 
+    # Créer le fichier unifié (SEUL fichier sauvegardé sur disque)
     vue_globale = creer_vue_globale(charts_unifies, features)
+    
+    resultat: Dict[str, pd.DataFrame] = {}
     if not vue_globale.empty:
         sortie_globale = os.path.join(DOSSIER_SORTIE, "musique_complete.csv")
         vue_globale.to_csv(sortie_globale, index=False)

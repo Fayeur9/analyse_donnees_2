@@ -26,9 +26,15 @@ CORS(app)
 limiter = Limiter(
     key_func=get_remote_address,
     app=app,
-    default_limits=["300 per day", "80 per hour"],
+    default_limits=["600 per day", "120 per hour"],
     storage_uri="memory://",
 )
+
+
+@app.errorhandler(429)
+def gerer_rate_limit(_erreur):
+    """Retour JSON uniforme quand une limite de requetes est atteinte."""
+    return jsonify({"error": "trop_de_requetes", "message": "Rate limit depasse, reessayez plus tard."}), 429
 
 
 class RegisterRequest(BaseModel):
@@ -405,6 +411,7 @@ def page_michael_jackson():
 
 
 @app.post("/register")
+@limiter.limit("3 per minute")
 def register():
     try:
         donnees = RegisterRequest(**(request.get_json(silent=True) or {}))
@@ -462,6 +469,7 @@ def login():
 
 
 @app.get("/protected")
+@limiter.limit("30 per minute")
 @token_requis
 def protected(charge_utile):
     session_db = SessionLocal()
@@ -482,6 +490,7 @@ def protected(charge_utile):
 
 
 @app.get("/stats")
+@limiter.limit("60 per minute")
 def stats():
     data = load_music_complete_data()
     data = prepare_charts_data(data)
@@ -505,6 +514,7 @@ def stats():
 
 
 @app.get("/datasets")
+@limiter.limit("20 per minute")
 @token_requis
 def datasets(_charge_utile):
     dossier_clean = os.path.join(os.path.dirname(__file__), "..", "data", "clean")
@@ -525,6 +535,7 @@ def datasets(_charge_utile):
 
 
 @app.get("/genres/evolution")
+@limiter.limit("60 per minute")
 def genres_evolution():
     period = request.args.get("period", "decennie").lower().strip()
     chart = request.args.get("chart", "all").lower().strip()
@@ -540,11 +551,13 @@ def genres_evolution():
 
 
 @app.get("/michael-jackson/heritage")
+@limiter.limit("60 per minute")
 def michael_jackson_heritage():
     return jsonify(_calculer_heritage_michael_jackson()), 200
 
 
 @app.get("/docs")
+@limiter.limit("120 per minute")
 def docs():
     return (
         jsonify(
@@ -554,13 +567,13 @@ def docs():
                 "theme": "Evolution des genres musicaux",
                 "endpoints": [
                     {"method": "GET", "path": "/health", "auth": False, "description": "Verifier que l'API repond"},
-                    {"method": "POST", "path": "/register", "auth": False, "description": "Inscrire un utilisateur"},
+                    {"method": "POST", "path": "/register", "auth": False, "rate_limit": "3/min", "description": "Inscrire un utilisateur"},
                     {"method": "POST", "path": "/login", "auth": False, "rate_limit": "5/min", "description": "Obtenir un token JWT"},
-                    {"method": "GET", "path": "/protected", "auth": True, "description": "Acceder au profil utilisateur"},
-                    {"method": "GET", "path": "/stats", "auth": False, "description": "Statistiques globales musique"},
-                    {"method": "GET", "path": "/datasets", "auth": True, "description": "Lister les datasets nettoyes"},
-                    {"method": "GET", "path": "/genres/evolution", "auth": False, "description": "Evolution des genres par periode"},
-                    {"method": "GET", "path": "/michael-jackson/heritage", "auth": False, "description": "Page bonus Michael Jackson"},
+                    {"method": "GET", "path": "/protected", "auth": True, "rate_limit": "30/min", "description": "Acceder au profil utilisateur"},
+                    {"method": "GET", "path": "/stats", "auth": False, "rate_limit": "60/min", "description": "Statistiques globales musique"},
+                    {"method": "GET", "path": "/datasets", "auth": True, "rate_limit": "20/min", "description": "Lister les datasets nettoyes"},
+                    {"method": "GET", "path": "/genres/evolution", "auth": False, "rate_limit": "60/min", "description": "Evolution des genres par periode"},
+                    {"method": "GET", "path": "/michael-jackson/heritage", "auth": False, "rate_limit": "60/min", "description": "Page bonus Michael Jackson"},
                     {"method": "GET", "path": "/page/genres", "auth": False, "description": "Page narrative evolution des genres"},
                     {"method": "GET", "path": "/page/michael-jackson", "auth": False, "description": "Page heritage Michael Jackson"},
                 ],
@@ -569,6 +582,15 @@ def docs():
         ),
         200,
     )
+
+
+@app.post("/refresh")
+@limiter.limit("10 per minute")
+@token_requis
+def refresh_token(charge_utile):
+    """Emet un nouveau JWT valide 30 min si le token courant est encore valide."""
+    nouveau_token = create_token(charge_utile["user_id"], charge_utile["role"], expires_minutes=30)
+    return jsonify({"access_token": nouveau_token, "token_type": "Bearer", "expires_in_minutes": 30}), 200
 
 
 if __name__ == "__main__":

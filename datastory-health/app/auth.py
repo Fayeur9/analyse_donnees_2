@@ -11,7 +11,15 @@ load_dotenv()
 
 # Chargement des secrets depuis .env
 JWT_SECRET = os.getenv("JWT_SECRET")
-FERNET_KEY = os.getenv("FERNET_KEY").encode()
+FERNET_KEY_RAW = os.getenv("FERNET_KEY")
+
+if not JWT_SECRET:
+    raise ValueError("JWT_SECRET manquant dans le fichier .env")
+
+if not FERNET_KEY_RAW:
+    raise ValueError("FERNET_KEY manquant dans le fichier .env")
+
+FERNET_KEY = FERNET_KEY_RAW.encode()
 
 # Initialisation du chiffreur Fernet
 cipher = Fernet(FERNET_KEY)
@@ -69,9 +77,7 @@ def verify_token(token: str) -> dict | None:
             algorithms=["HS256"]  # Explicite : evite l'attaque alg=none
         )
         return payload
-    except jwt.ExpiredSignatureError:
-        return None
-    except jwt.InvalidSignatureError:
+    except (jwt.ExpiredSignatureError, jwt.InvalidSignatureError, jwt.DecodeError):
         return None
     except Exception:
         return None
