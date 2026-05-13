@@ -1,10 +1,48 @@
 """Application Streamlit — DataStory Music."""
 
 import datetime
+import json
+from pathlib import Path
 
 import pandas as pd
 import requests
 import streamlit as st
+
+SESSION_FILE = Path(__file__).parent / ".session.json"
+
+
+def _sauvegarder_session():
+    if not st.session_state.get("access_token"):
+        return
+    data = {
+        "access_token": st.session_state.access_token,
+        "refresh_token": st.session_state.refresh_token,
+        "expires_at": st.session_state.expires_at.isoformat() if st.session_state.expires_at else None,
+        "username": st.session_state.username,
+        "role": st.session_state.role,
+        "user_id": st.session_state.user_id,
+    }
+    SESSION_FILE.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _charger_session():
+    if st.session_state.get("access_token"):
+        return
+    if not SESSION_FILE.exists():
+        return
+    try:
+        data = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
+        expires_at = None
+        if data.get("expires_at"):
+            expires_at = datetime.datetime.fromisoformat(data["expires_at"])
+        st.session_state.access_token = data.get("access_token")
+        st.session_state.refresh_token = data.get("refresh_token")
+        st.session_state.expires_at = expires_at
+        st.session_state.username = data.get("username")
+        st.session_state.role = data.get("role")
+        st.session_state.user_id = data.get("user_id")
+    except Exception:
+        SESSION_FILE.unlink(missing_ok=True)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -31,6 +69,7 @@ def _init_session():
     for cle, valeur in defaults.items():
         if cle not in st.session_state:
             st.session_state[cle] = valeur
+    _charger_session()
 
 
 def _stocker_token(token, expires_in_minutes, username, role, user_id, refresh_token=None, **_):
@@ -40,12 +79,14 @@ def _stocker_token(token, expires_in_minutes, username, role, user_id, refresh_t
     st.session_state.username = username
     st.session_state.role = role
     st.session_state.user_id = user_id
+    _sauvegarder_session()
 
 
 def _deconnecter():
     for cle in ["access_token", "refresh_token", "expires_at", "username", "role", "user_id"]:
         st.session_state[cle] = None
     st.session_state.auth_view = "login"
+    SESSION_FILE.unlink(missing_ok=True)
 
 
 def _est_connecte():
@@ -79,6 +120,7 @@ def _tenter_refresh():
         st.session_state.expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
             minutes=data.get("expires_in_minutes", 30)
         )
+        _sauvegarder_session()
         return True
 
     _deconnecter()
@@ -270,121 +312,335 @@ def page_profil():
         st.error(f"Impossible de charger le profil ({rep.status_code}).")
 
 
-def page_stats():
-    st.header("📊 Statistiques globales")
-    status_code, data = _get_public_json("/stats")
+def page_introduction():
+    import plotly.graph_objects as go
 
+    st.header("🏠 Introduction")
+
+    status_code, data = _get_public_json("/stats")
     if status_code != 200:
-        st.error("Impossible de charger les statistiques.")
+        st.error("Impossible de charger les données.")
         return
 
+    # --- KPIs dataset ---
     col1, col2, col3 = st.columns(3)
     col1.metric("Entrées totales", f"{data.get('total_lignes', 0):,}")
     col2.metric("Artistes uniques", f"{data.get('total_artistes', 0):,}")
     col3.metric("Morceaux uniques", f"{data.get('total_morceaux', 0):,}")
 
-    couverture = data.get("couverture_genres", {})
-    col4, col5, col6 = st.columns(3)
-    col4.metric("Avec genre", f"{couverture.get('avec_genre', 0):,}")
-    col5.metric("Sans genre", f"{couverture.get('sans_genre', 0):,}")
-    col6.metric("Couverture", f"{couverture.get('pourcentage_avec_genre', 0):.2f}%")
-
     periode = data.get("periode") or {}
     if periode:
         st.info(f"Période couverte : **{periode.get('debut')}** → **{periode.get('fin')}**")
 
-    sources_genres = data.get("sources_genres", {})
-    if sources_genres:
-        st.subheader("Couverture genres par source")
-        st.bar_chart(pd.Series(sources_genres).sort_values(ascending=False))
+    couverture = data.get("couverture_genres", {})
+    pct = couverture.get("pourcentage_avec_genre", 0)
+    avec = couverture.get("avec_genre", 0)
+    sans = couverture.get("sans_genre", 0)
+
+    total = data.get("total_lignes", 0)
+    sources = data.get("sources_genres", {})
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        # Pie : distribution par type de match
+        labels_map = {"track": "Par morceau", "artiste": "Par artiste", "inconnu": "Non trouvé"}
+        labels = [labels_map.get(k, k) for k in sources]
+        values = list(sources.values())
+        couleurs = ["#3b82f6", "#10b981", "#6b7280"]
+        fig_pie = go.Figure(go.Pie(
+            labels=labels,
+            values=values,
+            hole=0.45,
+            marker=dict(colors=couleurs),
+            textinfo="label+percent",
+            hovertemplate="%{label}<br>%{value:,} entrées<br>%{percent}<extra></extra>",
+        ))
+        fig_pie.update_layout(
+            title="Distribution des genres par type de correspondance",
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#e2e8f0"),
+            legend=dict(orientation="h", yanchor="bottom", y=-0.15),
+            margin=dict(t=60, b=40),
+        )
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+    with col_b:
+        # Jauge : pourcentage de match global
+        fig_gauge = go.Figure(go.Indicator(
+            mode="gauge+number+delta",
+            value=pct,
+            delta={"reference": 80, "valueformat": ".1f"},
+            number={"suffix": "%", "valueformat": ".2f"},
+            title={"text": "Taux de correspondance genre"},
+            gauge={
+                "axis": {"range": [0, 100]},
+                "bar": {"color": "#10b981"},
+                "steps": [
+                    {"range": [0, 50], "color": "#374151"},
+                    {"range": [50, 80], "color": "#1f2937"},
+                    {"range": [80, 100], "color": "#111827"},
+                ],
+                "threshold": {
+                    "line": {"color": "#f59e0b", "width": 4},
+                    "thickness": 0.75,
+                    "value": 80,
+                },
+            },
+        ))
+        fig_gauge.update_layout(
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#e2e8f0"),
+            margin=dict(t=40, b=20),
+        )
+        st.plotly_chart(fig_gauge, use_container_width=True)
+        st.caption(
+            f"**{avec:,}** entrées avec genre identifié · "
+            f"**{sans:,}** sans genre · "
+            f"Total : **{total:,}**"
+        )
 
 
-def page_genres():
-    st.header("🎼 Évolution des genres musicaux")
+def page_stats():
+    import plotly.graph_objects as go
 
-    col1, col2 = st.columns(2)
-    with col1:
-        period = st.selectbox("Période", ["annee", "decennie"], format_func=lambda x: "Année" if x == "annee" else "Décennie")
-    with col2:
-        top_n = st.slider("Top N genres", min_value=3, max_value=15, value=8)
+    st.header("📊 Statistiques globales")
 
-    params_evolution = (("period", period), ("top_n", str(top_n)))
-    params_totaux = (("period", period),)
-    status_code, data = _get_public_json("/genres/evolution", params_evolution)
-    _, data_totaux = _get_public_json("/genres/totaux", params_totaux)
+    _, domination = _get_public_json("/genres/domination", (("top_n", "10"),))
+    _, evo = _get_public_json("/genres/evolution", (("period", "annee"), ("top_n", "8")))
 
-    if status_code != 200:
-        st.error("Impossible de charger les données de genres.")
-        return
+    col_a, col_b = st.columns(2)
 
-    resultats = data.get("resultats", [])
-    resume = data_totaux.get("resume", data.get("resume", {}))
-    totaux_par_periode = data_totaux.get("totaux_par_periode", [])
+    with col_a:
+        if isinstance(domination, list) and domination:
+            genres_labels = [d["genre"] for d in domination]
+            nb_app = [d["nb_apparitions"] for d in domination]
+            rank_moy = [d["rank_moyen"] for d in domination]
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=genres_labels, y=nb_app,
+                name="Nombre d'apparitions",
+                marker_color="#3b82f6",
+                text=[f"{v:,}" for v in nb_app],
+                textposition="outside",
+                yaxis="y1",
+            ))
+            fig.add_trace(go.Scatter(
+                x=genres_labels, y=rank_moy,
+                name="Rang moyen",
+                mode="lines+markers",
+                line=dict(color="#dc2626", width=2),
+                marker=dict(size=6),
+                yaxis="y2",
+            ))
+            fig.update_layout(
+                title="Domination des genres : volume vs performance",
+                xaxis=dict(title=""),
+                yaxis=dict(title="Nombre d'apparitions", showgrid=False),
+                yaxis2=dict(title="Rang moyen", overlaying="y", side="right", showgrid=False),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#e2e8f0"), margin=dict(t=60),
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
-    st.caption(
-        f"{resume.get('lignes_analysees', 0):,} entrées analysées · "
-        f"{resume.get('genres_uniques', 0)} genres uniques"
-    )
-
-    if totaux_par_periode:
-        st.subheader("Volume total d'entrées par période")
-        df_totaux = pd.DataFrame(totaux_par_periode)
-        if "periode" in df_totaux.columns and "entrees_totales" in df_totaux.columns:
-            st.line_chart(df_totaux.set_index("periode")["entrees_totales"])
-
-    if not resultats:
-        st.info("Aucune donnée disponible.")
-        return
-
-    df = pd.DataFrame(resultats)
-
-    if not df.empty and "periode" in df.columns and "track_genre" in df.columns:
-        st.subheader("Parts des genres par période (top N)")
-        pivot = df.pivot_table(index="periode", columns="track_genre", values="entrees", fill_value=0)
-        st.bar_chart(pivot)
-
-    with st.expander("Voir les données brutes"):
-        st.dataframe(df, use_container_width=True)
+    with col_b:
+        resultats = evo.get("resultats", []) if isinstance(evo, dict) else []
+        if resultats:
+            df_evo = pd.DataFrame(resultats)
+            if not df_evo.empty and "periode" in df_evo.columns and "track_genre" in df_evo.columns:
+                pivot = df_evo.pivot_table(index="periode", columns="track_genre", values="entrees", fill_value=0)
+                pivot.index = pivot.index.astype(str)
+                st.subheader("Top genres par année")
+                st.bar_chart(pivot, height=430)
 
 
-def page_michael_jackson():
-    st.header("🕺 Héritage de Michael Jackson")
+def page_genres_tendances():
+    import plotly.graph_objects as go
+
+    st.header("🎼 Genres & Tendances")
+
+    _, longevite = _get_public_json("/genres/longevite", (("top_n", "10"),))
+    _, popularite = _get_public_json("/genres/popularite", (("top_n", "10"),))
+
+    col_c, col_d = st.columns(2)
+
+    with col_c:
+        if isinstance(longevite, list) and longevite:
+            longevite_sorted = sorted(longevite, key=lambda x: x["semaines"])
+            genres_l = [d["genre"].capitalize() for d in longevite_sorted]
+            semaines_l = [d["semaines"] for d in longevite_sorted]
+            leaders_l = [d["artiste_leader"] for d in longevite_sorted]
+            fig2 = go.Figure(go.Bar(
+                y=genres_l, x=semaines_l, orientation="h",
+                marker=dict(color=semaines_l, colorscale="Teal", showscale=True,
+                            colorbar=dict(title="Semaines cumulées", tickformat=".0s")),
+                text=leaders_l, textposition="inside", insidetextanchor="end",
+                textfont=dict(size=11, color="white"),
+            ))
+            fig2.update_layout(
+                title="Leaders de la longévité (Billboard 200)",
+                xaxis=dict(title="Semaines cumulées", tickformat=".0s"),
+                yaxis=dict(title=""),
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#e2e8f0"), showlegend=False, margin=dict(t=60),
+            )
+            st.plotly_chart(fig2, use_container_width=True)
+
+    with col_d:
+        if isinstance(popularite, list) and popularite:
+            pop_sorted = sorted(popularite, key=lambda x: x["popularite_moyenne"])
+            genres_p = [d["genre"].capitalize() for d in pop_sorted]
+            scores_p = [d["popularite_moyenne"] for d in pop_sorted]
+            fig3 = go.Figure(go.Bar(
+                y=genres_p, x=scores_p, orientation="h",
+                marker=dict(color=scores_p, colorscale="Viridis", showscale=True,
+                            colorbar=dict(title="Score popularité")),
+                text=[str(v) for v in scores_p], textposition="outside",
+                textfont=dict(size=11),
+            ))
+            fig3.update_layout(
+                title="Popularité moyenne (Top 10 Billboard) par genre",
+                xaxis=dict(title="Score de popularité moyen (Spotify)"),
+                yaxis=dict(title=""),
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#e2e8f0"), showlegend=False, margin=dict(t=60),
+            )
+            st.plotly_chart(fig3, use_container_width=True)
+def page_mj_heritage():
+    import plotly.graph_objects as go
+
+    st.header("🕴️ Michael Jackson — Héritage")
 
     status_code, data = _get_public_json("/michael-jackson/heritage")
-
     if status_code != 200:
         st.error("Impossible de charger les données.")
         return
 
     col1, col2, col3 = st.columns(3)
-    col1.metric("Entrées charts", data.get("entrees_total", 0))
-    col2.metric("Top 10", data.get("top_10_total", 0))
-    col3.metric("Meilleur rang", data.get("best_rank") or "—")
-
-    st.write(
+    col1.metric("Semaines totales", f"{data.get('semaines_totales', 0):,}", help="Présence cumulée Billboard 200")
+    col2.metric("Titres distincts", data.get("titres_distincts", "—"), help="Albums/Chansons")
+    col3.metric("Semaines au rang #1", data.get("semaines_rang1", "—"), help="Sommet du chart")
+    st.caption(
         f"Première apparition : **{data.get('premiere_apparition')}** · "
         f"Dernière : **{data.get('derniere_apparition')}**"
     )
 
-    morceaux = data.get("morceaux_iconiques", [])
-    if morceaux:
-        st.subheader("Morceaux iconiques — Timeline")
-        df_m = pd.DataFrame(morceaux)
-        if "date" in df_m.columns and "rank" in df_m.columns:
-            df_m["date"] = pd.to_datetime(df_m["date"], errors="coerce")
-            df_m = df_m.dropna(subset=["date"])
-            df_m["rang_inv"] = -df_m["rank"].astype(int)
-            st.scatter_chart(df_m.rename(columns={"song": "morceau"}), x="date", y="rang_inv", color="morceau")
-            st.caption("Axe Y : rang inversé (0 = #1). Plus c'est haut, meilleur le classement.")
-        with st.expander("Voir le tableau des morceaux"):
-            st.dataframe(df_m.drop(columns=["rang_inv"], errors="ignore"), use_container_width=True)
+    col_a, col_b = st.columns(2)
 
-    genres = data.get("genres_dominants", [])
-    if genres:
-        st.subheader("Genres dominants")
-        df_genres = pd.DataFrame(genres)
-        if "track_genre" in df_genres.columns and "occurrences" in df_genres.columns:
-            st.bar_chart(df_genres.set_index("track_genre")["occurrences"].sort_values(ascending=False))
+    with col_a:
+        evo = data.get("evolution_annuelle", [])
+        if evo:
+            df_evo = pd.DataFrame(evo)
+            fig_evo = go.Figure(go.Scatter(
+                x=df_evo["annee"], y=df_evo["semaines"],
+                mode="lines",
+                fill="tozeroy",
+                line=dict(color="#facc15", width=2),
+                fillcolor="rgba(250,204,21,0.25)",
+            ))
+            fig_evo.update_layout(
+                title="Évolution de la présence au Billboard 200",
+                xaxis=dict(title="Année"),
+                yaxis=dict(title="Semaines cumulées"),
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#e2e8f0"), margin=dict(t=60),
+            )
+            st.plotly_chart(fig_evo, use_container_width=True)
+            top5 = sorted(evo, key=lambda x: x["semaines"], reverse=True)[:5]
+            st.caption("Top 5 années : " + ", ".join(f"{r['annee']} ({r['semaines']} sem.)" for r in top5))
+
+    with col_b:
+        _, compa = _get_public_json("/michael-jackson/comparaison")
+        if isinstance(compa, list) and compa:
+            artistes_c = [d["artiste"] for d in compa]
+            semaines_c = [d["semaines"] for d in compa]
+            titres_c = [d["nb_titres"] for d in compa]
+            labels_c = [f"{s:,} sem.<br>({t} titres)" for s, t in zip(semaines_c, titres_c)]
+            fig_compa = go.Figure(go.Bar(
+                x=artistes_c, y=semaines_c,
+                marker=dict(color=titres_c, colorscale="Viridis", showscale=True,
+                            colorbar=dict(title="Nb titres")),
+                text=labels_c, textposition="outside",
+                textfont=dict(size=11),
+                customdata=list(zip(artistes_c, semaines_c, titres_c)),
+                hovertemplate="Artiste=%{customdata[0]}<br>Semaines=%{customdata[1]}<br>Titres=%{customdata[2]}<extra></extra>",
+            ))
+            fig_compa.update_layout(
+                title="MJ vs autres artistes : longévité et volume",
+                xaxis=dict(title="Artiste"),
+                yaxis=dict(title="Cumul des semaines"),
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#e2e8f0"), showlegend=False, margin=dict(t=60),
+            )
+            st.plotly_chart(fig_compa, use_container_width=True)
+
+
+def page_mj_discographie():
+    import plotly.graph_objects as go
+
+    st.header("🎵 Michael Jackson — Discographie & Thriller")
+
+    status_code, data = _get_public_json("/michael-jackson/heritage")
+    if status_code != 200:
+        st.error("Impossible de charger les données.")
+        return
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        albums = data.get("top_albums", [])
+        if albums:
+            albums_sorted = sorted(albums, key=lambda x: x["semaines"])
+            titres_a = [d["titre"] for d in albums_sorted]
+            semaines_a = [d["semaines"] for d in albums_sorted]
+            fig_albums = go.Figure(go.Bar(
+                y=titres_a, x=semaines_a, orientation="h",
+                marker=dict(color=semaines_a, colorscale="Blues", showscale=True,
+                            colorbar=dict(title="Semaines")),
+                text=semaines_a, textposition="outside",
+                textfont=dict(size=11),
+            ))
+            fig_albums.update_layout(
+                title="Top 10 albums au Billboard 200 (semaines cumulées)",
+                xaxis=dict(title="Semaines"),
+                yaxis=dict(title=""),
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#e2e8f0"), showlegend=False, margin=dict(t=60),
+            )
+            st.plotly_chart(fig_albums, use_container_width=True)
+
+    with col_b:
+        _, thriller = _get_public_json("/michael-jackson/thriller")
+        if isinstance(thriller, list) and thriller:
+            df_t = pd.DataFrame(thriller)
+            fig_t = go.Figure()
+            fig_t.add_trace(go.Bar(
+                x=df_t["annee"], y=df_t["semaines"],
+                name="Semaines présent",
+                marker_color="rgba(250,204,21,0.7)",
+                yaxis="y1",
+            ))
+            fig_t.add_trace(go.Scatter(
+                x=df_t["annee"], y=df_t["best_rank"],
+                name="Meilleur rang",
+                mode="lines+markers",
+                line=dict(color="#3b82f6", width=2),
+                marker=dict(size=6),
+                yaxis="y2",
+            ))
+            fig_t.update_layout(
+                title="Évolution de Thriller au Billboard 200",
+                xaxis=dict(title="Année", dtick=5),
+                yaxis=dict(title="Semaines présent", showgrid=False),
+                yaxis2=dict(title="Position (#1 = sommet)", overlaying="y", side="right",
+                            autorange="reversed", showgrid=False),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#e2e8f0"), margin=dict(t=70),
+            )
+            st.plotly_chart(fig_t, use_container_width=True)
+            st.caption("Barres jaunes : semaines présent · Courbe bleue : meilleur rang (axe inversé)")
 
 
 # ---------------------------------------------------------------------------
@@ -410,10 +666,11 @@ def main():
     sidebar_session()
 
     pages = {
+        "🏠 Introduction": page_introduction,
         "📊 Statistiques": page_stats,
-        "🎼 Genres musicaux": page_genres,
-        "🕺 Michael Jackson": page_michael_jackson,
-        "👤 Mon profil": page_profil,
+        "🎼 Genres & Tendances": page_genres_tendances,
+        "🕴️ MJ — Héritage": page_mj_heritage,
+        "🎵 MJ — Discographie": page_mj_discographie,
     }
 
     choix = st.sidebar.radio("Navigation", list(pages.keys()))

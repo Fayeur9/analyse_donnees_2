@@ -3,7 +3,9 @@
 import os
 import sys
 from functools import wraps
+from pathlib import Path
 
+import pandas as pd
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from sqlalchemy import func
@@ -130,8 +132,8 @@ def accueil():
         "message": "API DataStory Music",
         "endpoints": [
             "/health", "/register", "/login", "/refresh", "/protected",
-            "/stats", "/genres/evolution", "/genres/totaux",
-            "/michael-jackson/heritage", "/datasets",
+            "/stats", "/genres/evolution", "/genres/totaux", "/genres/domination", "/genres/longevite", "/genres/popularite",
+            "/michael-jackson/heritage", "/michael-jackson/comparaison", "/michael-jackson/thriller", "/datasets",
             "/page/genres", "/page/michael-jackson",
         ],
     }), 200
@@ -568,6 +570,121 @@ def genres_evolution():
         session_db.close()
 
 
+@app.get("/genres/longevite")
+def genres_longevite():
+    top_n = min(int(request.args.get("top_n", 10)), 30)
+    session_db = SessionLocal()
+    try:
+        # Total semaines cumulées par genre (source billboard200)
+        totaux = (
+            session_db.query(
+                MusicGenreObservation.track_genre.label("genre"),
+                func.count(MusicGenreObservation.id).label("semaines"),
+            )
+            .filter(MusicGenreObservation.source_chart == "billboard200")
+            .filter(MusicGenreObservation.track_genre.isnot(None))
+            .filter(func.lower(func.trim(MusicGenreObservation.track_genre)).notin_(GENRES_INCONNUS))
+            .group_by(MusicGenreObservation.track_genre)
+            .order_by(func.count(MusicGenreObservation.id).desc())
+            .limit(top_n)
+            .all()
+        )
+        top_genres = [r.genre for r in totaux]
+
+        # Artiste leader (le plus d'entrées) pour chaque genre
+        leaders = {}
+        for genre in top_genres:
+            leader = (
+                session_db.query(
+                    MusicGenreObservation.artist,
+                    func.count(MusicGenreObservation.id).label("cnt"),
+                )
+                .filter(MusicGenreObservation.source_chart == "billboard200")
+                .filter(MusicGenreObservation.track_genre == genre)
+                .group_by(MusicGenreObservation.artist)
+                .order_by(func.count(MusicGenreObservation.id).desc())
+                .first()
+            )
+            leaders[genre] = leader.artist if leader else ""
+
+        return jsonify([
+            {"genre": r.genre, "semaines": int(r.semaines), "artiste_leader": leaders.get(r.genre, "")}
+            for r in totaux
+        ]), 200
+    finally:
+        session_db.close()
+
+
+@app.get("/genres/popularite")
+def genres_popularite():
+    """Popularité Spotify moyenne par genre pour les morceaux dans le Top 10 Billboard."""
+    top_n = min(int(request.args.get("top_n", 10)), 30)
+    # Mapping genres DB -> genres CSV
+    GENRE_CSV = {"r&b": "r-n-b"}
+    CSV_PATH = Path(__file__).resolve().parent.parent / "data" / "train.csv"
+    try:
+        df_pop = pd.read_csv(CSV_PATH, usecols=["track_genre", "popularity"])
+    except FileNotFoundError:
+        return jsonify({"error": "fichier train.csv introuvable"}), 500
+
+    pop_par_genre = df_pop.groupby("track_genre")["popularity"].mean().round(1).to_dict()
+
+    session_db = SessionLocal()
+    try:
+        rows = (
+            session_db.query(
+                MusicGenreObservation.track_genre.label("genre"),
+                func.count(MusicGenreObservation.id).label("cnt"),
+            )
+            .filter(MusicGenreObservation.source_chart == "billboard200")
+            .filter(MusicGenreObservation.rank <= 10)
+            .filter(MusicGenreObservation.track_genre.isnot(None))
+            .filter(func.lower(func.trim(MusicGenreObservation.track_genre)).notin_(GENRES_INCONNUS))
+            .group_by(MusicGenreObservation.track_genre)
+            .order_by(func.count(MusicGenreObservation.id).desc())
+            .limit(top_n)
+            .all()
+        )
+        resultats = []
+        for r in rows:
+            genre_db = r.genre
+            genre_csv = GENRE_CSV.get(genre_db, genre_db)
+            pop = pop_par_genre.get(genre_csv)
+            if pop is not None:
+                resultats.append({"genre": genre_db, "popularite_moyenne": float(pop)})
+        resultats.sort(key=lambda x: x["popularite_moyenne"], reverse=True)
+        return jsonify(resultats), 200
+    finally:
+        session_db.close()
+
+
+@app.get("/genres/domination")
+def genres_domination():
+    top_n = min(int(request.args.get("top_n", 10)), 30)
+    session_db = SessionLocal()
+    try:
+        rows = (
+            session_db.query(
+                MusicGenreObservation.track_genre.label("genre"),
+                func.count(MusicGenreObservation.id).label("nb_apparitions"),
+                func.avg(MusicGenreObservation.rank).label("rank_moyen"),
+            )
+            .filter(MusicGenreObservation.track_genre.isnot(None))
+            .filter(func.lower(func.trim(MusicGenreObservation.track_genre)).notin_(GENRES_INCONNUS))
+            .filter(MusicGenreObservation.rank.isnot(None))
+            .group_by(MusicGenreObservation.track_genre)
+            .order_by(func.count(MusicGenreObservation.id).desc())
+            .limit(top_n)
+            .all()
+        )
+        return jsonify([
+            {"genre": r.genre, "nb_apparitions": int(r.nb_apparitions), "rank_moyen": round(float(r.rank_moyen), 1)}
+            for r in rows
+        ]), 200
+    finally:
+        session_db.close()
+
+
 @app.get("/genres/totaux")
 def genres_totaux():
     period = request.args.get("period", "decennie").lower().strip()
@@ -618,14 +735,42 @@ def michael_jackson_heritage():
             func.lower(MusicGenreObservation.artist).like("%michael jackson%")
         )
 
+        base_bb = base.filter(MusicGenreObservation.source_chart == "billboard200")
+
         entrees_total = int(base.count())
         if entrees_total == 0:
             return jsonify({"artiste": "Michael Jackson", "entrees_total": 0}), 200
+
+        # KPIs Billboard 200
+        semaines_totales = int(base_bb.count())
+        titres_distincts = int(base_bb.with_entities(func.count(func.distinct(MusicGenreObservation.song))).scalar() or 0)
+        semaines_rang1 = int(base_bb.filter(MusicGenreObservation.rank == 1).count())
 
         top_10_total = int(base.filter(MusicGenreObservation.rank <= 10).count())
         best_rank = base.with_entities(func.min(MusicGenreObservation.rank)).scalar()
         premiere = base.with_entities(func.min(MusicGenreObservation.date)).scalar()
         derniere = base.with_entities(func.max(MusicGenreObservation.date)).scalar()
+
+        # Évolution par année (Billboard 200)
+        evo_rows = (
+            base_bb
+            .with_entities(MusicGenreObservation.annee.label("annee"), func.count().label("semaines"))
+            .group_by(MusicGenreObservation.annee)
+            .order_by(MusicGenreObservation.annee)
+            .all()
+        )
+        evolution_annuelle = [{"annee": int(r.annee), "semaines": int(r.semaines)} for r in evo_rows if r.annee]
+
+        # Top 10 albums par semaines cumulées (Billboard 200)
+        albums_rows = (
+            base_bb
+            .with_entities(MusicGenreObservation.song.label("titre"), func.count().label("semaines"))
+            .group_by(MusicGenreObservation.song)
+            .order_by(func.count().desc())
+            .limit(10)
+            .all()
+        )
+        top_albums = [{"titre": r.titre, "semaines": int(r.semaines)} for r in albums_rows]
 
         # Morceaux iconiques dedupliques
         rows_icones = (
@@ -657,13 +802,72 @@ def michael_jackson_heritage():
         return jsonify({
             "artiste": "Michael Jackson",
             "entrees_total": entrees_total,
+            "semaines_totales": semaines_totales,
+            "titres_distincts": titres_distincts,
+            "semaines_rang1": semaines_rang1,
             "top_10_total": top_10_total,
             "best_rank": int(best_rank) if best_rank else None,
             "premiere_apparition": str(premiere) if premiere else None,
             "derniere_apparition": str(derniere) if derniere else None,
+            "evolution_annuelle": evolution_annuelle,
+            "top_albums": top_albums,
             "morceaux_iconiques": morceaux,
             "genres_dominants": [{"track_genre": g.track_genre, "occurrences": int(g.occ)} for g in genres],
         }), 200
+    finally:
+        session_db.close()
+
+
+@app.get("/michael-jackson/thriller")
+def michael_jackson_thriller():
+    session_db = SessionLocal()
+    try:
+        rows = (
+            session_db.query(
+                MusicGenreObservation.annee.label("annee"),
+                func.count().label("semaines"),
+                func.min(MusicGenreObservation.rank).label("best_rank"),
+                func.avg(MusicGenreObservation.rank).label("avg_rank"),
+            )
+            .filter(MusicGenreObservation.source_chart == "billboard200")
+            .filter(func.lower(MusicGenreObservation.song).like("%thriller%"))
+            .filter(func.lower(MusicGenreObservation.artist).like("%michael jackson%"))
+            .group_by(MusicGenreObservation.annee)
+            .order_by(MusicGenreObservation.annee)
+            .all()
+        )
+        return jsonify([
+            {
+                "annee": int(r.annee),
+                "semaines": int(r.semaines),
+                "best_rank": int(r.best_rank),
+                "avg_rank": round(float(r.avg_rank), 1),
+            }
+            for r in rows if r.annee
+        ]), 200
+    finally:
+        session_db.close()
+
+
+@app.get("/michael-jackson/comparaison")
+def michael_jackson_comparaison():
+    ARTISTES = ["The Beatles", "Elton John", "Michael Jackson", "Taylor Swift", "Madonna", "Prince"]
+    session_db = SessionLocal()
+    try:
+        resultats = []
+        for artiste in ARTISTES:
+            pattern = f"%{artiste.lower()}%"
+            sem = session_db.query(func.count()).filter(
+                MusicGenreObservation.source_chart == "billboard200",
+                func.lower(MusicGenreObservation.artist).like(pattern),
+            ).scalar() or 0
+            titres = session_db.query(func.count(func.distinct(MusicGenreObservation.song))).filter(
+                MusicGenreObservation.source_chart == "billboard200",
+                func.lower(MusicGenreObservation.artist).like(pattern),
+            ).scalar() or 0
+            resultats.append({"artiste": artiste, "semaines": int(sem), "nb_titres": int(titres)})
+        resultats.sort(key=lambda x: x["semaines"], reverse=True)
+        return jsonify(resultats), 200
     finally:
         session_db.close()
 

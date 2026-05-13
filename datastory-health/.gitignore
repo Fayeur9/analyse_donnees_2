@@ -14,3 +14,4 @@ htmlcov/
 *.vscode/
 data/*.csv
 data/clean/*.csv
+.session.json
