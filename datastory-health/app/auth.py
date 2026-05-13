@@ -57,30 +57,48 @@ def decrypt_field(encrypted_value: str) -> str:
 # GESTION DES TOKENS JWT
 # ============================================================================
 
-def create_token(user_id: int, role: str, expires_minutes: int = 30) -> str:
-    """Cree un token JWT signe avec expiration courte."""
+def create_token(
+    user_id: int,
+    role: str,
+    expires_minutes: int = 30,
+    token_type: str = "access",
+) -> str:
+    """Cree un token JWT signe avec type (access/refresh) et expiration."""
     payload = {
         "user_id": user_id,
         "role": role,
+        "type": token_type,
         "exp": datetime.datetime.utcnow() + datetime.timedelta(minutes=expires_minutes),
         "iat": datetime.datetime.utcnow(),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
 
-def verify_token(token: str) -> dict | None:
-    """Verifie et decode un JWT. Retourne None si invalide/expire."""
+def verify_token(token: str, expected_type: str | None = "access") -> dict | None:
+    """Verifie et decode un JWT. Retourne None si invalide/expire/type inattendu."""
     try:
         payload = jwt.decode(
             token,
             JWT_SECRET,
             algorithms=["HS256"]  # Explicite : evite l'attaque alg=none
         )
+        if expected_type and payload.get("type") != expected_type:
+            return None
         return payload
     except (jwt.ExpiredSignatureError, jwt.InvalidSignatureError, jwt.DecodeError):
         return None
     except Exception:
         return None
+
+
+def create_access_token(user_id: int, role: str, expires_minutes: int = 30) -> str:
+    """Alias explicite pour creer un access token."""
+    return create_token(user_id=user_id, role=role, expires_minutes=expires_minutes, token_type="access")
+
+
+def create_refresh_token(user_id: int, role: str, expires_minutes: int = 60 * 24 * 7) -> str:
+    """Cree un refresh token avec duree de vie longue (defaut 7 jours)."""
+    return create_token(user_id=user_id, role=role, expires_minutes=expires_minutes, token_type="refresh")
 
 
 # ============================================================================

@@ -31,7 +31,10 @@ def _init_session():
     """Initialise les clés session_state si elles sont absentes."""
     defaults = {
         "access_token": None,
+        "refresh_token": None,
         "expires_at": None,
+        "refresh_expires_at": None,
+        "access_ttl_seconds": 30 * 60,
         "username": None,
         "role": None,
         "user_id": None,
@@ -43,10 +46,26 @@ def _init_session():
             st.session_state[cle] = valeur
 
 
-def _stocker_token(token: str, expires_in_minutes: int, username: str, role: str, user_id: int):
+def _stocker_token(
+    token: str,
+    expires_in_minutes: int,
+    username: str,
+    role: str,
+    user_id: int,
+    refresh_token: str | None = None,
+    refresh_expires_in_minutes: int = 60 * 24 * 7,
+):
     """Enregistre le token et ses métadonnées dans session_state."""
     st.session_state.access_token = token
-    st.session_state.expires_at = datetime.datetime.utcnow() + datetime.timedelta(minutes=expires_in_minutes)
+    st.session_state.refresh_token = refresh_token
+    st.session_state.access_ttl_seconds = max(1, int(expires_in_minutes * 60))
+    st.session_state.expires_at = datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=expires_in_minutes)
+    if refresh_token:
+        st.session_state.refresh_expires_at = datetime.datetime.now(datetime.UTC) + datetime.timedelta(
+            minutes=refresh_expires_in_minutes
+        )
+    else:
+        st.session_state.refresh_expires_at = None
     st.session_state.username = username
     st.session_state.role = role
     st.session_state.user_id = user_id
@@ -56,7 +75,16 @@ def _stocker_token(token: str, expires_in_minutes: int, username: str, role: str
 
 def _deconnecter():
     """Efface toutes les données de session."""
-    for cle in ["access_token", "expires_at", "username", "role", "user_id"]:
+    for cle in [
+        "access_token",
+        "refresh_token",
+        "expires_at",
+        "refresh_expires_at",
+        "access_ttl_seconds",
+        "username",
+        "role",
+        "user_id",
+    ]:
         st.session_state[cle] = None
     st.session_state.auth_view = "login"
     st.session_state.login_error = ""
@@ -71,7 +99,10 @@ def _sauvegarder_session_locale():
 
     payload = {
         "access_token": st.session_state.access_token,
+        "refresh_token": st.session_state.refresh_token,
         "expires_at": st.session_state.expires_at.isoformat() if st.session_state.expires_at else None,
+        "refresh_expires_at": st.session_state.refresh_expires_at.isoformat() if st.session_state.refresh_expires_at else None,
+        "access_ttl_seconds": st.session_state.access_ttl_seconds,
         "username": st.session_state.username,
         "role": st.session_state.role,
         "user_id": st.session_state.user_id,
@@ -87,15 +118,40 @@ def _restaurer_session_locale() -> bool:
     try:
         payload = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
         expires_raw = payload.get("expires_at")
-        expires_at = datetime.datetime.fromisoformat(expires_raw) if expires_raw else None
+        refresh_expires_raw = payload.get("refresh_expires_at")
+        def _lire_dt(raw):
+            if not raw:
+                return None
+            dt = datetime.datetime.fromisoformat(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.UTC)
+            return dt
+
+        expires_at = _lire_dt(expires_raw)
+        refresh_expires_at = _lire_dt(refresh_expires_raw)
     except Exception:
         return False
 
-    if not payload.get("access_token") or not expires_at or expires_at <= datetime.datetime.utcnow():
+    if not payload.get("access_token") or not expires_at or expires_at <= datetime.datetime.now(datetime.UTC):
+        if (
+            payload.get("refresh_token")
+            and refresh_expires_at
+            and refresh_expires_at > datetime.datetime.now(datetime.UTC)
+        ):
+            st.session_state.refresh_token = payload.get("refresh_token")
+            st.session_state.refresh_expires_at = refresh_expires_at
+            st.session_state.access_ttl_seconds = int(payload.get("access_ttl_seconds") or 30 * 60)
+            st.session_state.username = payload.get("username")
+            st.session_state.role = payload.get("role")
+            st.session_state.user_id = payload.get("user_id")
+            return True
         return False
 
     st.session_state.access_token = payload.get("access_token")
+    st.session_state.refresh_token = payload.get("refresh_token")
     st.session_state.expires_at = expires_at
+    st.session_state.refresh_expires_at = refresh_expires_at
+    st.session_state.access_ttl_seconds = int(payload.get("access_ttl_seconds") or 30 * 60)
     st.session_state.username = payload.get("username")
     st.session_state.role = payload.get("role")
     st.session_state.user_id = payload.get("user_id")
@@ -103,14 +159,16 @@ def _restaurer_session_locale() -> bool:
 
 
 def _est_connecte() -> bool:
-    return bool(st.session_state.get("access_token"))
+    has_access = bool(st.session_state.get("access_token"))
+    has_refresh = bool(st.session_state.get("refresh_token"))
+    return has_access or has_refresh
 
 
 def _secondes_restantes() -> float:
     """Retourne le nombre de secondes avant expiration du token (peut être négatif)."""
     if not st.session_state.expires_at:
         return 0.0
-    delta = st.session_state.expires_at - datetime.datetime.utcnow()
+    delta = st.session_state.expires_at - datetime.datetime.now(datetime.UTC)
     return delta.total_seconds()
 
 
@@ -126,10 +184,17 @@ def _tenter_refresh() -> bool:
     """Tente de rafraîchir le token via POST /refresh.
     Retourne True si réussi, False sinon (token expiré → déconnexion).
     """
+    if not st.session_state.get("refresh_token"):
+        return False
+
+    if st.session_state.get("refresh_expires_at") and st.session_state.refresh_expires_at <= datetime.datetime.now(datetime.UTC):
+        _deconnecter()
+        return False
+
     try:
         rep = requests.post(
             f"{API_URL}/refresh",
-            headers=_entete_auth(),
+            json={"refresh_token": st.session_state.refresh_token},
             timeout=TIMEOUT_REQUETE,
         )
     except requests.RequestException:
@@ -138,8 +203,12 @@ def _tenter_refresh() -> bool:
     if rep.status_code == 200:
         data = rep.json()
         st.session_state.access_token = data["access_token"]
-        st.session_state.expires_at = datetime.datetime.utcnow() + datetime.timedelta(
+        st.session_state.refresh_token = data.get("refresh_token", st.session_state.refresh_token)
+        st.session_state.expires_at = datetime.datetime.now(datetime.UTC) + datetime.timedelta(
             minutes=data.get("expires_in_minutes", 30)
+        )
+        st.session_state.refresh_expires_at = datetime.datetime.now(datetime.UTC) + datetime.timedelta(
+            minutes=data.get("refresh_expires_in_minutes", 60 * 24 * 7)
         )
         _sauvegarder_session_locale()
         return True
@@ -154,10 +223,19 @@ def _token_valide_ou_refresh() -> bool:
     Retourne False si l'utilisateur doit se reconnecter.
     """
     restant = _secondes_restantes()
+    if not st.session_state.get("refresh_token"):
+        if restant <= 0:
+            _deconnecter()
+            return False
+        return True
+
     if restant <= 0:
-        _deconnecter()
-        return False
-    if restant < SEUIL_REFRESH_SECONDES:
+        return _tenter_refresh()
+
+    ttl = max(1, int(st.session_state.get("access_ttl_seconds") or 30 * 60))
+    # Seuil effectif: 20% de la durée de vie (min 5s), plafonné par la config globale.
+    seuil_effectif = min(SEUIL_REFRESH_SECONDES, max(5, int(ttl * 0.20)))
+    if restant < seuil_effectif:
         return _tenter_refresh()
     return True
 
@@ -179,6 +257,18 @@ def _appel_api(methode: str, chemin: str, **kwargs) -> requests.Response | None:
         return None
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def _get_public_json(chemin: str, params_items: tuple = ()):
+    """Cache léger pour les endpoints publics afin de limiter les appels répétés."""
+    params = dict(params_items) if params_items else None
+    rep = requests.get(f"{API_URL}{chemin}", params=params, timeout=TIMEOUT_REQUETE)
+    try:
+        data = rep.json()
+    except ValueError:
+        data = {}
+    return rep.status_code, data
+
+
 # ---------------------------------------------------------------------------
 # Page : connexion
 # ---------------------------------------------------------------------------
@@ -197,7 +287,7 @@ def page_connexion():
             soumettre = st.form_submit_button("Se connecter", use_container_width=True)
 
         st.caption("Pas encore de compte ?")
-        if st.button("Créer un compte", use_container_width=True):
+        if st.button("Créer un compte"):
             st.session_state.auth_view = "register"
             st.rerun()
 
@@ -236,6 +326,8 @@ def page_connexion():
                 username=profil.get("username", username),
                 role=profil.get("role", "user"),
                 user_id=profil.get("id"),
+                refresh_token=data.get("refresh_token"),
+                refresh_expires_in_minutes=data.get("refresh_expires_in_minutes", 60 * 24 * 7),
             )
             st.rerun()
 
@@ -261,7 +353,7 @@ def page_inscription():
             password = st.text_input("Mot de passe", type="password")
             soumettre = st.form_submit_button("Créer le compte", use_container_width=True)
 
-        if st.button("Retour à la connexion", use_container_width=True):
+        if st.button("Retour à la connexion"):
             st.session_state.auth_view = "login"
             st.rerun()
 
@@ -305,26 +397,13 @@ def sidebar_session():
         st.markdown("### 👤 Session")
         st.write(f"**Utilisateur :** {st.session_state.username}")
         st.write(f"**Rôle :** {st.session_state.role}")
+        restantes = max(0, int(_secondes_restantes()))
+        minutes, secondes = divmod(restantes, 60)
+        st.write(f"**Jeton (temps restant) :** {minutes:02d}:{secondes:02d}")
 
-        restant = _secondes_restantes()
-        if restant > 0:
-            mins = int(restant // 60)
-            secs = int(restant % 60)
-            couleur = "green" if restant > 120 else "orange"
-            st.markdown(
-                f"**Token expire dans :** :{couleur}[{mins}m {secs:02d}s]"
-            )
-        else:
-            st.markdown("**Token :** :red[expiré]")
 
-        if st.button("🔄 Rafraîchir le token"):
-            ok = _tenter_refresh()
-            if ok:
-                st.success("Token renouvelé.")
-            else:
-                st.error("Impossible de renouveler — reconnectez-vous.")
-                st.rerun()
-
+def sidebar_logout():
+    with st.sidebar:
         st.markdown("---")
         if st.button("🚪 Se déconnecter"):
             _deconnecter()
@@ -356,106 +435,116 @@ def page_profil():
 def page_stats():
     st.header("📊 Statistiques globales")
     try:
-        rep = requests.get(f"{API_URL}/stats", timeout=TIMEOUT_REQUETE)
+        status_code, data = _get_public_json("/stats")
     except requests.RequestException as exc:
         st.error(f"Erreur réseau : {exc}")
         return
 
-    if rep.status_code == 200:
-        data = rep.json()
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Entrées totales", f"{data.get('total_lignes', 0):,}")
-        col2.metric("Artistes uniques", f"{data.get('total_artistes', 0):,}")
-        col3.metric("Morceaux uniques", f"{data.get('total_morceaux', 0):,}")
-
-        couverture = data.get("couverture_genres", {})
-        col4, col5, col6 = st.columns(3)
-        col4.metric("Avec genre", f"{couverture.get('avec_genre', 0):,}")
-        col5.metric("Sans genre", f"{couverture.get('sans_genre', 0):,}")
-        col6.metric("Couverture", f"{couverture.get('pourcentage_avec_genre', 0):.2f}%")
-
-        sources = data.get("sources_genres", {})
-        if sources:
-            st.subheader("Sources des genres")
-            st.bar_chart(sources)
-
-        periode = data.get("periode") or {}
-        if periode:
-            st.info(
-                f"Période couverte : **{periode.get('debut')}** → **{periode.get('fin')}**"
-            )
-    else:
+    if status_code != 200:
         st.error("Impossible de charger les statistiques.")
+        return
+
+    import pandas as pd
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Entrées totales", f"{data.get('total_lignes', 0):,}")
+    col2.metric("Artistes uniques", f"{data.get('total_artistes', 0):,}")
+    col3.metric("Morceaux uniques", f"{data.get('total_morceaux', 0):,}")
+
+    couverture = data.get("couverture_genres", {})
+    col4, col5, col6 = st.columns(3)
+    col4.metric("Avec genre", f"{couverture.get('avec_genre', 0):,}")
+    col5.metric("Sans genre", f"{couverture.get('sans_genre', 0):,}")
+    col6.metric("Couverture", f"{couverture.get('pourcentage_avec_genre', 0):.2f}%")
+
+    periode = data.get("periode") or {}
+    if periode:
+        st.info(
+            f"Période couverte : **{periode.get('debut')}** → **{periode.get('fin')}**"
+        )
+
+    sources_genres = data.get("sources_genres", {})
+    if sources_genres:
+        st.subheader("Couverture genres par source")
+        st.caption(
+            "**track** = genre issu des métadonnées Spotify directement sur le morceau · "
+            "**artiste** = genre déduit depuis l'artiste (fallback) · "
+            "**inconnu** = aucun genre disponible"
+        )
+        serie = pd.Series(sources_genres).sort_values(ascending=False)
+        st.bar_chart(serie)
 
 
 def page_genres():
     st.header("🎼 Évolution des genres musicaux")
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     with col1:
         period = st.selectbox("Période", ["decennie", "annee"], format_func=lambda x: "Décennie" if x == "decennie" else "Année")
     with col2:
         top_n = st.slider("Top N genres", min_value=3, max_value=15, value=8)
-    with col3:
-        source = st.selectbox(
-            "Source du genre",
-            ["all", "track", "artiste"],
-            format_func=lambda x: "Toutes" if x == "all" else ("Track matché" if x == "track" else "Genre artiste"),
-        )
 
     try:
-        rep = requests.get(
-            f"{API_URL}/genres/evolution",
-            params={"period": period, "top_n": top_n, "genre_source": source},
-            timeout=TIMEOUT_REQUETE,
-        )
+        params_evolution = (("period", period), ("top_n", str(top_n)))
+        params_totaux = (("period", period),)
+        status_code, data = _get_public_json("/genres/evolution", params_evolution)
+        _, data_totaux = _get_public_json("/genres/totaux", params_totaux)
     except requests.RequestException as exc:
         st.error(f"Erreur réseau : {exc}")
         return
 
-    if rep.status_code != 200:
+    if status_code != 200:
         st.error("Impossible de charger les données de genres.")
         return
 
-    data = rep.json()
+    import pandas as pd
+
     resultats = data.get("resultats", [])
-    resume = data.get("resume", {})
+    resume = data_totaux.get("resume", data.get("resume", {}))
+    totaux_par_periode = data_totaux.get("totaux_par_periode", [])
 
     st.caption(
         f"{resume.get('lignes_analysees', 0):,} entrées analysées · "
         f"{resume.get('genres_uniques', 0)} genres uniques"
     )
 
+    # Chart 3 — Volume total d'entrées par période
+    if totaux_par_periode:
+        st.subheader("Volume total d'entrées par période")
+        df_totaux = pd.DataFrame(totaux_par_periode)
+        if "periode" in df_totaux.columns and "entrees_totales" in df_totaux.columns:
+            df_totaux["periode"] = df_totaux["periode"].astype(str)
+            st.line_chart(df_totaux.set_index("periode")["entrees_totales"])
+
     if not resultats:
         st.info("Aucune donnée disponible.")
         return
 
-    import pandas as pd
     df = pd.DataFrame(resultats)
 
-    # Graphique en barres empilées
+    # Chart 2 — Parts des genres par période (barres empilées)
     if not df.empty and "periode" in df.columns and "track_genre" in df.columns:
+        st.subheader("Parts des genres par période (top N)")
         pivot = df.pivot_table(index="periode", columns="track_genre", values="entrees", fill_value=0)
+        pivot.index = pivot.index.astype(str)
         st.bar_chart(pivot)
 
     with st.expander("Voir les données brutes"):
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, width="stretch")
 
 
 def page_michael_jackson():
     st.header("🕺 Héritage de Michael Jackson")
 
     try:
-        rep = requests.get(f"{API_URL}/michael-jackson/heritage", timeout=TIMEOUT_REQUETE)
+        status_code, data = _get_public_json("/michael-jackson/heritage")
     except requests.RequestException as exc:
         st.error(f"Erreur réseau : {exc}")
         return
 
-    if rep.status_code != 200:
+    if status_code != 200:
         st.error("Impossible de charger les données.")
         return
-
-    data = rep.json()
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Entrées charts", data.get("entrees_total", 0))
@@ -467,18 +556,36 @@ def page_michael_jackson():
         f"Dernière : **{data.get('derniere_apparition')}**"
     )
 
+    import pandas as pd
+
+    # Chart 4 — Timeline des morceaux iconiques
     morceaux = data.get("morceaux_iconiques", [])
     if morceaux:
-        st.subheader("Morceaux iconiques (top 10)")
-        import pandas as pd
-        st.dataframe(pd.DataFrame(morceaux), use_container_width=True)
+        st.subheader("Morceaux iconiques — Timeline")
+        df_m = pd.DataFrame(morceaux)
+        if "date" in df_m.columns and "rank" in df_m.columns:
+            df_m["date"] = pd.to_datetime(df_m["date"], errors="coerce")
+            df_m = df_m.dropna(subset=["date"])
+            df_m["rang_inv"] = -df_m["rank"].astype(int)
+            st.scatter_chart(
+                df_m.rename(columns={"song": "morceau"}),
+                x="date",
+                y="rang_inv",
+                color="morceau",
+            )
+            st.caption("Axe Y : rang inversé (0 = #1, -10 = #10). Plus c'est haut, meilleur le classement.")
+        with st.expander("Voir le tableau des morceaux"):
+            st.dataframe(df_m.drop(columns=["rang_inv"], errors="ignore"), width="stretch")
 
+    # Chart 5 — Genres dominants
     genres = data.get("genres_dominants", [])
     if genres:
         st.subheader("Genres dominants")
-        import pandas as pd
         df_genres = pd.DataFrame(genres)
-        st.bar_chart(df_genres.set_index("track_genre")["occurrences"])
+        if "track_genre" in df_genres.columns and "occurrences" in df_genres.columns:
+            st.bar_chart(
+                df_genres.set_index("track_genre")["occurrences"].sort_values(ascending=False)
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +632,7 @@ def main():
     }
 
     choix = st.sidebar.radio("Navigation", list(pages.keys()))
+    sidebar_logout()
     pages[choix]()
 
 

@@ -124,6 +124,26 @@ class MusicTrackFeature(Base):
         return session.query(cls).filter(cls.artists.ilike(f"%{artiste}%")).all()
 
 
+class MusicGenreObservation(Base):
+    """Observation analytique normalisee pour les endpoints genres/statistiques."""
+
+    __tablename__ = "music_genre_observations"
+
+    id = Column(Integer, primary_key=True)
+    source_chart = Column(String(60), index=True)
+    date = Column(Date, index=True)
+    annee = Column(Integer, index=True)
+    decennie = Column(String(10), index=True)
+    song = Column(String(255), index=True)
+    artist = Column(String(255), index=True)
+    rank = Column(Integer, index=True)
+    track_genre = Column(String(80), index=True)
+    genre_source = Column(String(20), index=True)
+
+    def __repr__(self):
+        return f"<MusicGenreObservation {self.decennie} {self.track_genre} #{self.rank}>"
+
+
 def init_db():
     """Cree les tables si elles n'existent pas deja."""
     Base.metadata.create_all(bind=engine)
