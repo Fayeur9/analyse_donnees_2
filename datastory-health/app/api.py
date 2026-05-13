@@ -1,172 +1,80 @@
-"""API Flask du projet DataStory Music."""
+"""API Flask — DataStory Music."""
 
-from functools import lru_cache, wraps
 import os
+import sys
+from functools import wraps
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
-from pydantic import BaseModel, EmailStr, ValidationError, field_validator
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 
-try:
-    from .auth import (
-        create_access_token,
-        create_refresh_token,
-        decrypt_field,
-        encrypt_field,
-        hash_password,
-        verify_password,
-        verify_token,
-    )
-    from .data_processing import charger_tous_les_datasets, load_music_complete_data, prepare_charts_data
-    from .models import SessionLocal, MusicGenreObservation, User, init_db
-except ImportError:
-    from auth import (
-        create_access_token,
-        create_refresh_token,
-        decrypt_field,
-        encrypt_field,
-        hash_password,
-        verify_password,
-        verify_token,
-    )
-    from data_processing import charger_tous_les_datasets, load_music_complete_data, prepare_charts_data
-    from models import SessionLocal, MusicGenreObservation, User, init_db
+# Permet de lancer le fichier directement (python app/api.py) ou de l'importer
+sys.path.insert(0, os.path.dirname(__file__))
+from auth import (
+    create_access_token,
+    create_refresh_token,
+    decrypt_field,
+    encrypt_field,
+    hash_password,
+    verify_password,
+    verify_token,
+)
+from data_processing import charger_tous_les_datasets, load_music_complete_data, prepare_charts_data
+from models import SessionLocal, MusicGenreObservation, User, init_db
 
 
-# Durée de vie de l'access token (en minutes) — changer ici pour ajuster
-ACCESS_TOKEN_TTL_MINUTES: int = 1
+# Duree de vie du token d'acces en minutes
+ACCESS_TOKEN_TTL_MINUTES = 30
 
 app = Flask(__name__)
 CORS(app)
 
-limiter = Limiter(
-    key_func=get_remote_address,
-    app=app,
-    default_limits=["600 per day", "120 per hour"],
-    storage_uri="memory://",
-)
-
-
-@app.errorhandler(429)
-def gerer_rate_limit(_erreur):
-    """Retour JSON uniforme quand une limite de requetes est atteinte."""
-    return jsonify({"error": "trop_de_requetes", "message": "Rate limit depasse, reessayez plus tard."}), 429
-
-
-class RegisterRequest(BaseModel):
-    """Corps attendu pour l'inscription."""
-
-    username: str
-    email: EmailStr
-    password: str
-
-    @field_validator("username")
-    @classmethod
-    def username_length(cls, valeur: str) -> str:
-        valeur = valeur.strip()
-        if len(valeur) < 3:
-            raise ValueError("le nom d'utilisateur doit contenir au moins 3 caracteres")
-        if len(valeur) > 50:
-            raise ValueError("le nom d'utilisateur doit contenir au maximum 50 caracteres")
-        return valeur
-
-    @field_validator("password")
-    @classmethod
-    def password_length(cls, valeur: str) -> str:
-        if len(valeur) < 8:
-            raise ValueError("le mot de passe doit contenir au moins 8 caracteres")
-        return valeur
-
-
-class RequeteConnexion(BaseModel):
-    """Corps attendu pour la connexion."""
-
-    username: str
-    password: str
-
-
-class RequeteRefresh(BaseModel):
-    """Corps attendu pour le rafraichissement de session."""
-
-    refresh_token: str
-
-
-def erreur_validation(erreur: ValidationError):
-    """Retourne une reponse uniforme quand la validation Pydantic echoue."""
-    return jsonify({"error": "erreur_validation", "details": erreur.errors()}), 400
-
-
-def token_requis(func):
-    """Verifie le JWT dans l'en-tete Authorization avant d'acceder a la route."""
-
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        en_tete_auth = request.headers.get("Authorization", "")
-        if not en_tete_auth.startswith("Bearer "):
-            return jsonify({"error": "entete_authorization_absent_ou_invalide"}), 401
-
-        token = en_tete_auth.replace("Bearer ", "", 1).strip()
-        charge_utile = verify_token(token)
-        if not charge_utile:
-            return jsonify({"error": "token_invalide_ou_expire"}), 401
-
-        return func(charge_utile, *args, **kwargs)
-
-    return wrapper
-
-
+# Valeurs de genre considerees comme "inconnues" — exclues des analyses
 GENRES_INCONNUS = ("", "inconnu", "unknown", "unk", "none", "nan")
 
 
-def _appliquer_filtres_requete_genres(query, chart: str, genre_source: str):
-    """Applique les filtres SQL pour les endpoints analytics genres."""
-    if chart != "all":
-        query = query.filter(MusicGenreObservation.source_chart == chart)
+def token_requis(f):
+    """Decorateur qui verifie le token JWT avant d'acceder a une route protegee."""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        en_tete = request.headers.get("Authorization", "")
+        if not en_tete.startswith("Bearer "):
+            return jsonify({"error": "token manquant"}), 401
+        token = en_tete.replace("Bearer ", "", 1).strip()
+        payload = verify_token(token)
+        if not payload:
+            return jsonify({"error": "token invalide ou expire"}), 401
+        return f(payload, *args, **kwargs)
+    return wrapper
 
-    if genre_source != "all":
-        query = query.filter(MusicGenreObservation.genre_source == genre_source)
 
-    query = query.filter(MusicGenreObservation.track_genre.isnot(None))
-    query = query.filter(
-        func.lower(func.trim(MusicGenreObservation.track_genre)).notin_(GENRES_INCONNUS)
-    )
-    return query
-
-
-def _calculer_decennie(annee: int) -> str:
+def _calculer_decennie(annee):
+    """Convertit une annee en chaine de decennie, ex: 1985 -> '1980s'."""
     return f"{(annee // 10) * 10}s"
 
 
-def _vider_caches_analytics():
-    _calculer_evolution_genres.cache_clear()
-    _calculer_totaux_genres.cache_clear()
-    _calculer_heritage_michael_jackson.cache_clear()
-
-
 def _synchroniser_observations_genres_depuis_csv():
-    """Recharge la table analytique à partir du fichier musique_complete.csv."""
+    """Charge musique_complete.csv et peuple la table music_genre_observations."""
+    import pandas as pd
+
     data = load_music_complete_data()
     data = prepare_charts_data(data)
+
     if data.empty:
         return {"inserted": 0, "source_rows": 0}
 
+    # Ajouter les colonnes manquantes avec des valeurs par defaut
     if "track_genre" not in data.columns:
         data["track_genre"] = "inconnu"
     if "genre_source" not in data.columns:
-        data["genre_source"] = data["track_genre"].apply(lambda x: "track" if str(x).strip() else "inconnu")
+        data["genre_source"] = "inconnu"
 
-    # Colonnes minimales pour l'analytics SQL.
-    colonnes_requises = ["source_chart", "date", "song", "artist", "rank", "track_genre", "genre_source"]
-    for colonne in colonnes_requises:
-        if colonne not in data.columns:
-            data[colonne] = None
+    for col in ["source_chart", "date", "song", "artist", "rank", "track_genre", "genre_source"]:
+        if col not in data.columns:
+            data[col] = None
 
-    data["date"] = data["date"] if "date" in data.columns else None
-    data["date"] = data["date"].astype("datetime64[ns]")
+    data["date"] = pd.to_datetime(data["date"], errors="coerce")
     data = data.dropna(subset=["date", "song", "artist"]).copy()
     data["annee"] = data["date"].dt.year.astype(int)
     data["decennie"] = data["annee"].apply(_calculer_decennie)
@@ -174,294 +82,59 @@ def _synchroniser_observations_genres_depuis_csv():
     session_db = SessionLocal()
     inserted = 0
     try:
-        session_db.query(MusicGenreObservation).delete(synchronize_session=False)
+        # Vider la table avant de la reremplir
+        session_db.query(MusicGenreObservation).delete()
         session_db.commit()
 
-        chunk_size = 5000
-        total = len(data)
-        for start in range(0, total, chunk_size):
-            bloc = data.iloc[start:start + chunk_size]
-            mappings = []
-            for row in bloc.itertuples(index=False):
-                mappings.append(
-                    {
-                        "source_chart": str(getattr(row, "source_chart", "") or ""),
-                        "date": getattr(row, "date").date(),
-                        "annee": int(getattr(row, "annee")),
-                        "decennie": str(getattr(row, "decennie")),
-                        "song": str(getattr(row, "song", "") or "").strip(),
-                        "artist": str(getattr(row, "artist", "") or "").strip(),
-                        "rank": int(getattr(row, "rank", 0) or 0),
-                        "track_genre": str(getattr(row, "track_genre", "") or "").strip().lower(),
-                        "genre_source": str(getattr(row, "genre_source", "inconnu") or "inconnu").strip().lower(),
-                    }
+        # Inserer par lots de 1000 lignes pour ne pas saturer la memoire
+        for i in range(0, len(data), 1000):
+            chunk = data.iloc[i:i + 1000]
+            objets = []
+            for _, row in chunk.iterrows():
+                obs = MusicGenreObservation(
+                    source_chart=str(row.get("source_chart") or ""),
+                    date=row["date"].date(),
+                    annee=int(row["annee"]),
+                    decennie=str(row["decennie"]),
+                    song=str(row.get("song") or "").strip(),
+                    artist=str(row.get("artist") or "").strip(),
+                    rank=int(row.get("rank") or 0),
+                    track_genre=str(row.get("track_genre") or "").strip().lower(),
+                    genre_source=str(row.get("genre_source") or "inconnu").strip().lower(),
                 )
-            if mappings:
-                session_db.bulk_insert_mappings(MusicGenreObservation, mappings)
-                session_db.commit()
-                inserted += len(mappings)
+                objets.append(obs)
+            session_db.add_all(objets)
+            session_db.commit()
+            inserted += len(objets)
     except Exception:
         session_db.rollback()
         raise
     finally:
         session_db.close()
 
-    _vider_caches_analytics()
-    return {"inserted": int(inserted), "source_rows": int(len(data))}
+    return {"inserted": inserted, "source_rows": len(data)}
 
 
-@lru_cache(maxsize=128)
-def _calculer_evolution_genres(
-    period: str = "decennie", chart: str = "all", top_n: int = 8, genre_source: str = "all"
-):
-    """Agrege l'evolution des genres depuis la base SQL uniquement."""
-    session_db = SessionLocal()
-    try:
-        periode_col = MusicGenreObservation.annee if period == "annee" else MusicGenreObservation.decennie
-        base = _appliquer_filtres_requete_genres(
-            session_db.query(MusicGenreObservation),
-            chart=chart,
-            genre_source=genre_source,
-        )
-
-        lignes_analysees = int(base.count())
-        genres_uniques = int(
-            _appliquer_filtres_requete_genres(
-                session_db.query(MusicGenreObservation.track_genre),
-                chart=chart,
-                genre_source=genre_source,
-            )
-            .distinct()
-            .count()
-        )
-
-        if lignes_analysees == 0:
-            return {
-                "periode": period,
-                "chart": chart,
-                "genre_source": genre_source,
-                "resultats": [],
-                "resume": {"lignes_analysees": 0, "genres_uniques": 0},
-            }
-
-        rows = (
-            _appliquer_filtres_requete_genres(
-                session_db.query(
-                    periode_col.label("periode"),
-                    MusicGenreObservation.track_genre.label("track_genre"),
-                    func.count(MusicGenreObservation.id).label("entrees"),
-                    func.avg(MusicGenreObservation.rank).label("rang_moyen"),
-                ),
-                chart=chart,
-                genre_source=genre_source,
-            )
-            .group_by(periode_col, MusicGenreObservation.track_genre)
-            .all()
-        )
-
-        par_periode = {}
-        for row in rows:
-            periode = str(row.periode)
-            par_periode.setdefault(periode, []).append(
-                {
-                    "periode": periode,
-                    "track_genre": row.track_genre,
-                    "entrees": int(row.entrees),
-                    "rang_moyen": round(float(row.rang_moyen or 0.0), 2),
-                }
-            )
-
-        resultats = []
-        for periode in sorted(par_periode.keys()):
-            top = sorted(par_periode[periode], key=lambda x: x["entrees"], reverse=True)[:top_n]
-            resultats.extend(top)
-
-        return {
-            "periode": period,
-            "chart": chart,
-            "genre_source": genre_source,
-            "resultats": resultats,
-            "resume": {
-                "lignes_analysees": lignes_analysees,
-                "genres_uniques": genres_uniques,
-            },
-        }
-    finally:
-        session_db.close()
-
-
-@lru_cache(maxsize=64)
-def _calculer_totaux_genres(period: str = "decennie", chart: str = "all", genre_source: str = "all"):
-    """Retourne uniquement des totaux par période depuis la base SQL."""
-    session_db = SessionLocal()
-    try:
-        periode_col = MusicGenreObservation.annee if period == "annee" else MusicGenreObservation.decennie
-        base = _appliquer_filtres_requete_genres(
-            session_db.query(MusicGenreObservation),
-            chart=chart,
-            genre_source=genre_source,
-        )
-
-        lignes_analysees = int(base.count())
-        genres_uniques = int(
-            _appliquer_filtres_requete_genres(
-                session_db.query(MusicGenreObservation.track_genre),
-                chart=chart,
-                genre_source=genre_source,
-            )
-            .distinct()
-            .count()
-        )
-
-        if lignes_analysees == 0:
-            return {
-                "periode": period,
-                "chart": chart,
-                "genre_source": genre_source,
-                "totaux_par_periode": [],
-                "resume": {"lignes_analysees": 0, "genres_uniques": 0},
-            }
-
-        rows = (
-            _appliquer_filtres_requete_genres(
-                session_db.query(
-                    periode_col.label("periode"),
-                    func.count(MusicGenreObservation.id).label("entrees_totales"),
-                    func.count(func.distinct(MusicGenreObservation.track_genre)).label("genres_uniques"),
-                ),
-                chart=chart,
-                genre_source=genre_source,
-            )
-            .group_by(periode_col)
-            .order_by(periode_col)
-            .all()
-        )
-
-        return {
-            "periode": period,
-            "chart": chart,
-            "genre_source": genre_source,
-            "totaux_par_periode": [
-                {
-                    "periode": str(row.periode),
-                    "entrees_totales": int(row.entrees_totales),
-                    "genres_uniques": int(row.genres_uniques),
-                }
-                for row in rows
-            ],
-            "resume": {
-                "lignes_analysees": lignes_analysees,
-                "genres_uniques": genres_uniques,
-            },
-        }
-    finally:
-        session_db.close()
-
-
-@lru_cache(maxsize=8)
-def _calculer_heritage_michael_jackson():
-    """Construit des indicateurs sur l'heritage chart de Michael Jackson via SQL."""
-    session_db = SessionLocal()
-    try:
-        base = session_db.query(MusicGenreObservation).filter(
-            func.lower(MusicGenreObservation.artist).like("%michael jackson%")
-        )
-
-        entrees_total = int(base.count())
-        if entrees_total == 0:
-            return {
-                "artiste": "Michael Jackson",
-                "entrees_total": 0,
-                "top_10_total": 0,
-                "best_rank": None,
-                "premiere_apparition": None,
-                "derniere_apparition": None,
-                "morceaux_iconiques": [],
-                "genres_dominants": [],
-            }
-
-        top_10_total = int(base.filter(MusicGenreObservation.rank <= 10).count())
-        best_rank = base.with_entities(func.min(MusicGenreObservation.rank)).scalar()
-        premiere = base.with_entities(func.min(MusicGenreObservation.date)).scalar()
-        derniere = base.with_entities(func.max(MusicGenreObservation.date)).scalar()
-
-        rows_iconiques = (
-            base.filter(MusicGenreObservation.rank <= 10)
-            .with_entities(MusicGenreObservation.song, MusicGenreObservation.rank, MusicGenreObservation.date)
-            .order_by(MusicGenreObservation.rank.asc(), MusicGenreObservation.date.asc())
-            .all()
-        )
-        vus = set()
-        morceaux_iconiques = []
-        for row in rows_iconiques:
-            key = (row.song or "").strip().lower()
-            if key in vus:
-                continue
-            vus.add(key)
-            morceaux_iconiques.append(
-                {
-                    "song": row.song,
-                    "rank": int(row.rank),
-                    "date": str(row.date),
-                }
-            )
-            if len(morceaux_iconiques) >= 12:
-                break
-
-        genres = (
-            base.with_entities(
-                MusicGenreObservation.track_genre.label("track_genre"),
-                func.count(MusicGenreObservation.id).label("occurrences"),
-            )
-            .filter(MusicGenreObservation.track_genre.isnot(None))
-            .group_by(MusicGenreObservation.track_genre)
-            .order_by(func.count(MusicGenreObservation.id).desc())
-            .limit(6)
-            .all()
-        )
-
-        return {
-            "artiste": "Michael Jackson",
-            "entrees_total": entrees_total,
-            "top_10_total": top_10_total,
-            "best_rank": int(best_rank) if best_rank is not None else None,
-            "premiere_apparition": str(premiere) if premiere else None,
-            "derniere_apparition": str(derniere) if derniere else None,
-            "morceaux_iconiques": morceaux_iconiques,
-            "genres_dominants": [
-                {"track_genre": row.track_genre, "occurrences": int(row.occurrences)}
-                for row in genres
-            ],
-        }
-    finally:
-        session_db.close()
-
+# ---------------------------------------------------------------------------
+# Routes generales
+# ---------------------------------------------------------------------------
 
 @app.get("/health")
 def health():
-    return jsonify({"statut": "ok", "theme": "musique"}), 200
+    return jsonify({"statut": "ok"}), 200
 
 
 @app.get("/")
 def accueil():
-    return (
-        jsonify(
-            {
-                "message": "API DataStory Music active",
-                "theme": "Evolution des genres musicaux par periodes",
-                "pages": ["/page/genres", "/page/michael-jackson"],
-                "endpoints_utiles": [
-                    "/health",
-                    "/docs",
-                    "/register",
-                    "/login",
-                    "/genres/evolution",
-                    "/michael-jackson/heritage",
-                ],
-            }
-        ),
-        200,
-    )
+    return jsonify({
+        "message": "API DataStory Music",
+        "endpoints": [
+            "/health", "/register", "/login", "/refresh", "/protected",
+            "/stats", "/genres/evolution", "/genres/totaux",
+            "/michael-jackson/heritage", "/datasets",
+            "/page/genres", "/page/michael-jackson",
+        ],
+    }), 200
 
 
 @app.get("/page/genres")
@@ -650,118 +323,144 @@ def page_michael_jackson():
 """, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
+# ---------------------------------------------------------------------------
+# Authentification
+# ---------------------------------------------------------------------------
+
 @app.post("/register")
-@limiter.limit("3 per minute")
 def register():
-    try:
-        donnees = RegisterRequest(**(request.get_json(silent=True) or {}))
-    except ValidationError as erreur:
-        return erreur_validation(erreur)
+    body = request.get_json(silent=True) or {}
+    username = (body.get("username") or "").strip()
+    email = (body.get("email") or "").strip()
+    password = body.get("password") or ""
+
+    # Validation basique des champs
+    if len(username) < 3 or len(username) > 50:
+        return jsonify({"error": "nom d'utilisateur invalide (3 a 50 caracteres)"}), 400
+    if "@" not in email:
+        return jsonify({"error": "email invalide"}), 400
+    if len(password) < 8:
+        return jsonify({"error": "mot de passe trop court (8 caracteres minimum)"}), 400
 
     session_db = SessionLocal()
     try:
-        utilisateur_existant = session_db.query(User).filter(User.username == donnees.username).first()
-        if utilisateur_existant:
-            return jsonify({"error": "nom_utilisateur_deja_existant"}), 409
-
-        courriel_chiffre = encrypt_field(donnees.email)
-        empreinte_mot_de_passe = hash_password(donnees.password)
+        if session_db.query(User).filter(User.username == username).first():
+            return jsonify({"error": "nom d'utilisateur deja utilise"}), 409
 
         utilisateur = User(
-            username=donnees.username,
-            email=courriel_chiffre,
-            password_hash=empreinte_mot_de_passe,
+            username=username,
+            email=encrypt_field(email),
+            password_hash=hash_password(password),
             role="user",
         )
         session_db.add(utilisateur)
         session_db.commit()
         session_db.refresh(utilisateur)
-
-        return jsonify({"id": utilisateur.id, "username": utilisateur.username, "role": utilisateur.role}), 201
+        return jsonify({"message": "inscription reussie", "id": utilisateur.id, "username": utilisateur.username}), 201
     except IntegrityError:
         session_db.rollback()
-        return jsonify({"error": "conflit_creation_utilisateur"}), 409
-    except Exception:
-        session_db.rollback()
-        return jsonify({"error": "echec_inscription"}), 500
+        return jsonify({"error": "email deja utilise"}), 409
     finally:
         session_db.close()
 
 
 @app.post("/login")
-@limiter.limit("5 per minute")
 def login():
-    try:
-        donnees = RequeteConnexion(**(request.get_json(silent=True) or {}))
-    except ValidationError as erreur:
-        return erreur_validation(erreur)
+    body = request.get_json(silent=True) or {}
+    username = (body.get("username") or "").strip()
+    password = body.get("password") or ""
+
+    if not username or not password:
+        return jsonify({"error": "username et password requis"}), 400
 
     session_db = SessionLocal()
     try:
-        utilisateur = session_db.query(User).filter(User.username == donnees.username).first()
-        if not utilisateur or not verify_password(donnees.password, utilisateur.password_hash):
-            return jsonify({"error": "identifiants_invalides"}), 401
+        utilisateur = session_db.query(User).filter(User.username == username).first()
+        if not utilisateur or not verify_password(password, utilisateur.password_hash):
+            return jsonify({"error": "identifiants invalides"}), 401
 
         access_token = create_access_token(utilisateur.id, utilisateur.role, expires_minutes=ACCESS_TOKEN_TTL_MINUTES)
         refresh_token = create_refresh_token(utilisateur.id, utilisateur.role)
-        return (
-            jsonify(
-                {
-                    "access_token": access_token,
-                    "refresh_token": refresh_token,
-                    "token_type": "Bearer",
-                    "expires_in_minutes": ACCESS_TOKEN_TTL_MINUTES,
-                    "refresh_expires_in_minutes": 60 * 24 * 7,
-                }
-            ),
-            200,
-        )
+
+        return jsonify({
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "Bearer",
+            "expires_in_minutes": ACCESS_TOKEN_TTL_MINUTES,
+            "refresh_expires_in_minutes": 60 * 24 * 7,
+            "user_id": utilisateur.id,
+            "username": utilisateur.username,
+            "role": utilisateur.role,
+        }), 200
+    finally:
+        session_db.close()
+
+
+@app.post("/refresh")
+def refresh():
+    body = request.get_json(silent=True) or {}
+    token_recu = body.get("refresh_token") or ""
+
+    if not token_recu:
+        return jsonify({"error": "refresh_token requis"}), 400
+
+    payload = verify_token(token_recu, expected_type="refresh")
+    if not payload:
+        return jsonify({"error": "refresh token invalide ou expire"}), 401
+
+    session_db = SessionLocal()
+    try:
+        utilisateur = session_db.query(User).filter(User.id == payload.get("user_id")).first()
+        if not utilisateur:
+            return jsonify({"error": "utilisateur introuvable"}), 404
+
+        nouvel_access = create_access_token(utilisateur.id, utilisateur.role, expires_minutes=ACCESS_TOKEN_TTL_MINUTES)
+        nouveau_refresh = create_refresh_token(utilisateur.id, utilisateur.role)
+
+        return jsonify({
+            "access_token": nouvel_access,
+            "refresh_token": nouveau_refresh,
+            "token_type": "Bearer",
+            "expires_in_minutes": ACCESS_TOKEN_TTL_MINUTES,
+            "refresh_expires_in_minutes": 60 * 24 * 7,
+        }), 200
     finally:
         session_db.close()
 
 
 @app.get("/protected")
-@limiter.limit("30 per minute")
 @token_requis
-def protected(charge_utile):
+def protected(payload):
     session_db = SessionLocal()
     try:
-        utilisateur = session_db.query(User).filter(User.id == charge_utile.get("user_id")).first()
+        utilisateur = session_db.query(User).filter(User.id == payload.get("user_id")).first()
         if not utilisateur:
-            return jsonify({"error": "utilisateur_introuvable"}), 404
+            return jsonify({"error": "utilisateur introuvable"}), 404
 
-        courriel = None
         try:
-            courriel = decrypt_field(utilisateur.email)
+            email = decrypt_field(utilisateur.email)
         except Exception:
-            courriel = None
+            email = None
 
-        return jsonify({"id": utilisateur.id, "username": utilisateur.username, "role": utilisateur.role, "email": courriel}), 200
+        return jsonify({
+            "id": utilisateur.id,
+            "username": utilisateur.username,
+            "role": utilisateur.role,
+            "email": email,
+        }), 200
     finally:
         session_db.close()
 
 
+# ---------------------------------------------------------------------------
+# Analytics
+# ---------------------------------------------------------------------------
+
 @app.get("/stats")
-@limiter.limit("60 per minute")
 def stats():
     session_db = SessionLocal()
     try:
         total_lignes = int(session_db.query(func.count(MusicGenreObservation.id)).scalar() or 0)
-        if total_lignes == 0:
-            return (
-                jsonify(
-                    {
-                        "total_lignes": 0,
-                        "total_artistes": 0,
-                        "total_morceaux": 0,
-                        "periode": None,
-                        "couverture_genres": {"avec_genre": 0, "sans_genre": 0, "pourcentage_avec_genre": 0.0},
-                        "sources_genres": {},
-                    }
-                ),
-                200,
-            )
-
         total_artistes = int(session_db.query(func.count(func.distinct(MusicGenreObservation.artist))).scalar() or 0)
         total_morceaux = int(session_db.query(func.count(func.distinct(MusicGenreObservation.song))).scalar() or 0)
 
@@ -769,196 +468,232 @@ def stats():
             session_db.query(func.count(MusicGenreObservation.id))
             .filter(MusicGenreObservation.track_genre.isnot(None))
             .filter(func.lower(func.trim(MusicGenreObservation.track_genre)).notin_(GENRES_INCONNUS))
-            .scalar()
-            or 0
+            .scalar() or 0
         )
-        sans_genre = int(total_lignes - avec_genre)
 
         sources_rows = (
             session_db.query(MusicGenreObservation.genre_source, func.count(MusicGenreObservation.id))
             .group_by(MusicGenreObservation.genre_source)
             .all()
         )
-        sources_genres = {str(source or "inconnu"): int(total) for source, total in sources_rows}
+        sources_genres = {str(src or "inconnu"): int(total) for src, total in sources_rows}
 
         debut = session_db.query(func.min(MusicGenreObservation.date)).scalar()
         fin = session_db.query(func.max(MusicGenreObservation.date)).scalar()
 
-        return (
-            jsonify(
-                {
-                    "total_lignes": total_lignes,
-                    "total_artistes": total_artistes,
-                    "total_morceaux": total_morceaux,
-                    "couverture_genres": {
-                        "avec_genre": avec_genre,
-                        "sans_genre": sans_genre,
-                        "pourcentage_avec_genre": round((avec_genre / total_lignes) * 100, 2),
-                    },
-                    "sources_genres": sources_genres,
-                    "periode": {
-                        "debut": str(debut) if debut else None,
-                        "fin": str(fin) if fin else None,
-                    },
-                }
-            ),
-            200,
+        return jsonify({
+            "total_lignes": total_lignes,
+            "total_artistes": total_artistes,
+            "total_morceaux": total_morceaux,
+            "couverture_genres": {
+                "avec_genre": avec_genre,
+                "sans_genre": total_lignes - avec_genre,
+                "pourcentage_avec_genre": round((avec_genre / total_lignes) * 100, 2) if total_lignes > 0 else 0.0,
+            },
+            "sources_genres": sources_genres,
+            "periode": {
+                "debut": str(debut) if debut else None,
+                "fin": str(fin) if fin else None,
+            },
+        }), 200
+    finally:
+        session_db.close()
+
+
+@app.get("/genres/evolution")
+def genres_evolution():
+    period = request.args.get("period", "decennie").lower().strip()
+    top_n_str = request.args.get("top_n", "8")
+    top_n = int(top_n_str) if top_n_str.isdigit() else 8
+    chart = request.args.get("chart", "all").lower().strip()
+    genre_source = request.args.get("genre_source", "all").lower().strip()
+
+    if period not in ["decennie", "annee"]:
+        return jsonify({"error": "period doit etre 'decennie' ou 'annee'"}), 400
+
+    session_db = SessionLocal()
+    try:
+        periode_col = MusicGenreObservation.annee if period == "annee" else MusicGenreObservation.decennie
+
+        query = session_db.query(
+            periode_col.label("periode"),
+            MusicGenreObservation.track_genre,
+            func.count(MusicGenreObservation.id).label("entrees"),
+            func.avg(MusicGenreObservation.rank).label("rang_moyen"),
         )
+
+        # Filtres optionnels
+        if chart != "all":
+            query = query.filter(MusicGenreObservation.source_chart == chart)
+        if genre_source != "all":
+            query = query.filter(MusicGenreObservation.genre_source == genre_source)
+
+        # Exclure les genres inconnus
+        query = query.filter(MusicGenreObservation.track_genre.isnot(None))
+        query = query.filter(
+            func.lower(func.trim(MusicGenreObservation.track_genre)).notin_(GENRES_INCONNUS)
+        )
+
+        rows = query.group_by(periode_col, MusicGenreObservation.track_genre).all()
+
+        # Regrouper par periode et garder le top N
+        par_periode = {}
+        for row in rows:
+            p = str(row.periode)
+            par_periode.setdefault(p, []).append({
+                "periode": p,
+                "track_genre": row.track_genre,
+                "entrees": int(row.entrees),
+                "rang_moyen": round(float(row.rang_moyen or 0), 2),
+            })
+
+        resultats = []
+        for p in sorted(par_periode.keys()):
+            top = sorted(par_periode[p], key=lambda x: x["entrees"], reverse=True)[:top_n]
+            resultats.extend(top)
+
+        genres_uniques = len(set(r["track_genre"] for r in resultats))
+
+        return jsonify({
+            "periode": period,
+            "chart": chart,
+            "genre_source": genre_source,
+            "resultats": resultats,
+            "resume": {
+                "lignes_analysees": sum(r["entrees"] for r in resultats),
+                "genres_uniques": genres_uniques,
+            },
+        }), 200
+    finally:
+        session_db.close()
+
+
+@app.get("/genres/totaux")
+def genres_totaux():
+    period = request.args.get("period", "decennie").lower().strip()
+    chart = request.args.get("chart", "all").lower().strip()
+
+    if period not in ["decennie", "annee"]:
+        return jsonify({"error": "period doit etre 'decennie' ou 'annee'"}), 400
+
+    session_db = SessionLocal()
+    try:
+        periode_col = MusicGenreObservation.annee if period == "annee" else MusicGenreObservation.decennie
+
+        query = session_db.query(
+            periode_col.label("periode"),
+            func.count(MusicGenreObservation.id).label("entrees_totales"),
+            func.count(func.distinct(MusicGenreObservation.track_genre)).label("genres_uniques"),
+        )
+        if chart != "all":
+            query = query.filter(MusicGenreObservation.source_chart == chart)
+        query = query.filter(MusicGenreObservation.track_genre.isnot(None))
+        query = query.filter(
+            func.lower(func.trim(MusicGenreObservation.track_genre)).notin_(GENRES_INCONNUS)
+        )
+
+        rows = query.group_by(periode_col).order_by(periode_col).all()
+        totaux = [
+            {"periode": str(r.periode), "entrees_totales": int(r.entrees_totales), "genres_uniques": int(r.genres_uniques)}
+            for r in rows
+        ]
+
+        return jsonify({
+            "periode": period,
+            "totaux_par_periode": totaux,
+            "resume": {
+                "lignes_analysees": sum(r["entrees_totales"] for r in totaux),
+                "genres_uniques": int(query.with_entities(func.count(func.distinct(MusicGenreObservation.track_genre))).scalar() or 0),
+            },
+        }), 200
+    finally:
+        session_db.close()
+
+
+@app.get("/michael-jackson/heritage")
+def michael_jackson_heritage():
+    session_db = SessionLocal()
+    try:
+        base = session_db.query(MusicGenreObservation).filter(
+            func.lower(MusicGenreObservation.artist).like("%michael jackson%")
+        )
+
+        entrees_total = int(base.count())
+        if entrees_total == 0:
+            return jsonify({"artiste": "Michael Jackson", "entrees_total": 0}), 200
+
+        top_10_total = int(base.filter(MusicGenreObservation.rank <= 10).count())
+        best_rank = base.with_entities(func.min(MusicGenreObservation.rank)).scalar()
+        premiere = base.with_entities(func.min(MusicGenreObservation.date)).scalar()
+        derniere = base.with_entities(func.max(MusicGenreObservation.date)).scalar()
+
+        # Morceaux iconiques dedupliques
+        rows_icones = (
+            base.filter(MusicGenreObservation.rank <= 10)
+            .with_entities(MusicGenreObservation.song, MusicGenreObservation.rank, MusicGenreObservation.date)
+            .order_by(MusicGenreObservation.rank.asc())
+            .all()
+        )
+        vus = set()
+        morceaux = []
+        for row in rows_icones:
+            key = (row.song or "").strip().lower()
+            if key not in vus:
+                vus.add(key)
+                morceaux.append({"song": row.song, "rank": int(row.rank), "date": str(row.date)})
+            if len(morceaux) >= 12:
+                break
+
+        # Genres les plus frequents
+        genres = (
+            base.with_entities(MusicGenreObservation.track_genre, func.count(MusicGenreObservation.id).label("occ"))
+            .filter(MusicGenreObservation.track_genre.isnot(None))
+            .group_by(MusicGenreObservation.track_genre)
+            .order_by(func.count(MusicGenreObservation.id).desc())
+            .limit(6)
+            .all()
+        )
+
+        return jsonify({
+            "artiste": "Michael Jackson",
+            "entrees_total": entrees_total,
+            "top_10_total": top_10_total,
+            "best_rank": int(best_rank) if best_rank else None,
+            "premiere_apparition": str(premiere) if premiere else None,
+            "derniere_apparition": str(derniere) if derniere else None,
+            "morceaux_iconiques": morceaux,
+            "genres_dominants": [{"track_genre": g.track_genre, "occurrences": int(g.occ)} for g in genres],
+        }), 200
     finally:
         session_db.close()
 
 
 @app.post("/admin/sync-analytics-db")
-@limiter.limit("2 per minute")
 @token_requis
-def sync_analytics_db(_charge_utile):
-    """Recharge la table analytics SQL depuis data/clean/musique_complete.csv."""
+def sync_analytics_db(_payload):
+    """Recharge la table analytics depuis musique_complete.csv (admin uniquement)."""
     try:
         resultat = _synchroniser_observations_genres_depuis_csv()
-    except Exception:
-        return jsonify({"error": "echec_synchronisation_analytics_db"}), 500
-    return jsonify({"message": "synchronisation_terminee", **resultat}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"message": "synchronisation terminee", **resultat}), 200
 
 
 @app.get("/datasets")
-@limiter.limit("20 per minute")
 @token_requis
-def datasets(_charge_utile):
+def datasets(_payload):
     dossier_clean = os.path.join(os.path.dirname(__file__), "..", "data", "clean")
     jeux = charger_tous_les_datasets(dossier_data=dossier_clean)
-
     infos = []
-    for nom_fichier, frame in jeux.items():
-        infos.append(
-            {
-                "fichier": nom_fichier,
-                "lignes": int(len(frame)),
-                "colonnes": list(frame.columns),
-                "types": {colonne: str(dtype) for colonne, dtype in frame.dtypes.items()},
-            }
-        )
-
-    return jsonify({"dossier": "data/clean", "nb_datasets": len(infos), "datasets": infos}), 200
-
-
-@app.get("/genres/evolution")
-@limiter.limit("60 per minute")
-def genres_evolution():
-    period = request.args.get("period", "decennie").lower().strip()
-    chart = request.args.get("chart", "all").lower().strip()
-    genre_source = request.args.get("genre_source", "all").lower().strip()
-    top_n = request.args.get("top_n", "8").strip()
-
-    if period not in ["decennie", "annee"]:
-        return jsonify({"error": "period doit etre 'decennie' ou 'annee'"}), 400
-    if genre_source not in ["all", "track", "artiste"]:
-        return jsonify({"error": "genre_source doit etre 'all', 'track' ou 'artiste'"}), 400
-    if not top_n.isdigit():
-        return jsonify({"error": "top_n doit etre un entier positif"}), 400
-
-    resultat = _calculer_evolution_genres(
-        period=period,
-        chart=chart,
-        top_n=max(1, int(top_n)),
-        genre_source=genre_source,
-    )
-    return jsonify(resultat), 200
-
-
-@app.get("/genres/totaux")
-@limiter.limit("60 per minute")
-def genres_totaux():
-    period = request.args.get("period", "decennie").lower().strip()
-    chart = request.args.get("chart", "all").lower().strip()
-    genre_source = request.args.get("genre_source", "all").lower().strip()
-
-    if period not in ["decennie", "annee"]:
-        return jsonify({"error": "period doit etre 'decennie' ou 'annee'"}), 400
-    if genre_source not in ["all", "track", "artiste"]:
-        return jsonify({"error": "genre_source doit etre 'all', 'track' ou 'artiste'"}), 400
-
-    resultat = _calculer_totaux_genres(period=period, chart=chart, genre_source=genre_source)
-    return jsonify(resultat), 200
-
-
-@app.get("/michael-jackson/heritage")
-@limiter.limit("60 per minute")
-def michael_jackson_heritage():
-    return jsonify(_calculer_heritage_michael_jackson()), 200
-
-
-@app.get("/docs")
-@limiter.limit("120 per minute")
-def docs():
-    return (
-        jsonify(
-            {
-                "title": "API DataStory Music",
-                "version": "2.0.0",
-                "theme": "Evolution des genres musicaux",
-                "endpoints": [
-                    {"method": "GET", "path": "/health", "auth": False, "description": "Verifier que l'API repond"},
-                    {"method": "POST", "path": "/register", "auth": False, "rate_limit": "3/min", "description": "Inscrire un utilisateur"},
-                    {"method": "POST", "path": "/login", "auth": False, "rate_limit": "5/min", "description": "Obtenir un token JWT"},
-                    {"method": "GET", "path": "/protected", "auth": True, "rate_limit": "30/min", "description": "Acceder au profil utilisateur"},
-                    {"method": "GET", "path": "/stats", "auth": False, "rate_limit": "60/min", "description": "Statistiques globales musique"},
-                    {"method": "POST", "path": "/admin/sync-analytics-db", "auth": True, "rate_limit": "2/min", "description": "Recharger la table analytics depuis le CSV"},
-                    {"method": "GET", "path": "/datasets", "auth": True, "rate_limit": "20/min", "description": "Lister les datasets nettoyes"},
-                    {"method": "GET", "path": "/genres/evolution", "auth": False, "rate_limit": "60/min", "description": "Evolution des genres par periode"},
-                    {"method": "GET", "path": "/genres/totaux", "auth": False, "rate_limit": "60/min", "description": "Totaux des genres par periode"},
-                    {"method": "GET", "path": "/michael-jackson/heritage", "auth": False, "rate_limit": "60/min", "description": "Page bonus Michael Jackson"},
-                    {"method": "GET", "path": "/page/genres", "auth": False, "description": "Page narrative evolution des genres"},
-                    {"method": "GET", "path": "/page/michael-jackson", "auth": False, "description": "Page heritage Michael Jackson"},
-                ],
-                "auth": {"type": "JWT Bearer", "header": "Authorization: Bearer <token>"},
-            }
-        ),
-        200,
-    )
-
-
-@app.post("/refresh")
-@limiter.limit("10 per minute")
-def refresh_token():
-    """Emet un nouveau couple access/refresh a partir d'un refresh token valide."""
-    try:
-        donnees = RequeteRefresh(**(request.get_json(silent=True) or {}))
-        refresh_token_recu = donnees.refresh_token
-    except ValidationError:
-        en_tete_auth = request.headers.get("Authorization", "")
-        if en_tete_auth.startswith("Bearer "):
-            refresh_token_recu = en_tete_auth.replace("Bearer ", "", 1).strip()
-        else:
-            return jsonify({"error": "refresh_token_requis"}), 400
-
-    charge_utile = verify_token(refresh_token_recu, expected_type="refresh")
-    if not charge_utile:
-        return jsonify({"error": "refresh_token_invalide_ou_expire"}), 401
-
-    session_db = SessionLocal()
-    try:
-        utilisateur = session_db.query(User).filter(User.id == charge_utile.get("user_id")).first()
-        if not utilisateur:
-            return jsonify({"error": "utilisateur_introuvable"}), 404
-
-        nouvel_access_token = create_access_token(utilisateur.id, utilisateur.role, expires_minutes=ACCESS_TOKEN_TTL_MINUTES)
-        nouveau_refresh_token = create_refresh_token(utilisateur.id, utilisateur.role)
-        return (
-            jsonify(
-                {
-                    "access_token": nouvel_access_token,
-                    "refresh_token": nouveau_refresh_token,
-                    "token_type": "Bearer",
-                    "expires_in_minutes": ACCESS_TOKEN_TTL_MINUTES,
-                    "refresh_expires_in_minutes": 60 * 24 * 7,
-                }
-            ),
-            200,
-        )
-    finally:
-        session_db.close()
+    for nom, frame in jeux.items():
+        infos.append({
+            "fichier": nom,
+            "lignes": len(frame),
+            "colonnes": list(frame.columns),
+        })
+    return jsonify({"datasets": infos}), 200
 
 
 if __name__ == "__main__":
     init_db()
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    app.run(debug=True)

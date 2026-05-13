@@ -72,18 +72,6 @@ class MusicChartEntry(Base):
     def __repr__(self):
         return f"<MusicChartEntry {self.source_chart} {self.date} #{self.rank} {self.artist} - {self.song}>"
 
-    @classmethod
-    def get_by_period(cls, session, date_debut, date_fin):
-        return session.query(cls).filter(cls.date >= date_debut, cls.date <= date_fin).all()
-
-    @classmethod
-    def get_by_artist(cls, session, artiste):
-        return session.query(cls).filter(cls.artist.ilike(f"%{artiste}%")).all()
-
-    @classmethod
-    def get_by_chart(cls, session, chart_name):
-        return session.query(cls).filter(cls.source_chart == chart_name).all()
-
 
 class MusicTrackFeature(Base):
     """Caracteristiques audio des morceaux (dataset train.csv)."""
@@ -114,14 +102,6 @@ class MusicTrackFeature(Base):
 
     def __repr__(self):
         return f"<MusicTrackFeature {self.artists} - {self.track_name} ({self.track_genre})>"
-
-    @classmethod
-    def get_by_genre(cls, session, genre):
-        return session.query(cls).filter(cls.track_genre == genre).all()
-
-    @classmethod
-    def get_by_artist(cls, session, artiste):
-        return session.query(cls).filter(cls.artists.ilike(f"%{artiste}%")).all()
 
 
 class MusicGenreObservation(Base):
